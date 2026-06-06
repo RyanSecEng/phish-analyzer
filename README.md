@@ -55,6 +55,15 @@ To save an email as `.eml`:
 python3 phish-analyzer.py suspicious.eml
 ```
 
+**Options:**
+
+| Flag | Effect |
+|------|--------|
+| `-q`, `--quiet` | Print only the final risk-score line (banner, headers, and detail suppressed) — handy for scripting or scanning many files. |
+| `-v`, `--verbose` | Show full detail, including every decoded link (the default view caps the list at 25). |
+
+Output is **color-coded** by risk tier and includes a visual severity meter, e.g. `RISK SCORE: 25  [██████████]  HIGH`. Colors are emitted only to an interactive terminal and are automatically disabled when output is piped or redirected, or when the `NO_COLOR` environment variable is set.
+
 ---
 
 ## Example Output
@@ -143,6 +152,20 @@ Proofpoint-aware mode automatically reduces SPF, DKIM, and DMARC weights to +1 w
 - Attachment hashing (MD5/SHA256) for known-malware lookups
 - Configurable weight overrides via a config file
 - MIME attachment type inventory (flags unexpected executables or macros)
+
+---
+
+## UX Roadmap
+
+Improvements aimed squarely at making the tool faster and friendlier to read at a glance.
+
+1. **`--no-color` flag** — an explicit command-line switch to force color off (complements the existing `NO_COLOR` env-var support).
+2. **Grouped, prioritized signals** — sort findings highest-weight first and group them by category (Auth / Links / Content) under subheadings.
+3. **Plain-English "what to do next" line per verdict** — e.g. HIGH → "Do not click links; report to your security team."
+4. **Top-of-report TL;DR box** — verdict plus the single strongest signal shown first, before the full breakdown.
+5. **Progress / status feedback** — brief "Parsing headers… Decoding links…" cues so large emails don't look frozen.
+6. **`--help` / `-h` screen with examples** — a proper usage screen beyond the current one-line hint.
+7. **Clickable decoded links** — render destinations as OSC 8 terminal hyperlinks (with a `--no-hyperlinks` escape hatch), wrapping only the already-sanitized host so the terminal-injection protection is preserved.
 
 ---
 

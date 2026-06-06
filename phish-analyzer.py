@@ -34,6 +34,106 @@ import urllib.parse
 from email import policy
 from html.parser import HTMLParser
 
+# Force UTF-8 output so box-drawing glyphs and em-dashes survive on consoles
+# whose default code page (e.g. Windows cp1252) can't encode them — otherwise
+# piped/redirected output raises UnicodeEncodeError mid-report.
+try:
+    sys.stdout.reconfigure(encoding='utf-8')
+    sys.stderr.reconfigure(encoding='utf-8')
+except Exception:
+    pass
+
+# ---------- TERMINAL COLOR SUPPORT ----------
+# Color is emitted only to a real interactive terminal. It is suppressed when
+# output is piped/redirected or when NO_COLOR is set (https://no-color.org/), so
+# logs, SIEM pipelines, and CI captures stay clean and parseable.
+COLOR_ENABLED = sys.stdout.isatty() and os.environ.get('NO_COLOR') is None
+
+if COLOR_ENABLED and os.name == 'nt':
+    # Enable ANSI/VT processing on Windows consoles (cmd.exe, older hosts);
+    # Windows Terminal already supports it, but this makes plain consoles work.
+    try:
+        import ctypes
+        _k32 = ctypes.windll.kernel32
+        _h = _k32.GetStdHandle(-11)             # STD_OUTPUT_HANDLE
+        _mode = ctypes.c_uint32()
+        if _k32.GetConsoleMode(_h, ctypes.byref(_mode)):
+            # 0x0004 = ENABLE_VIRTUAL_TERMINAL_PROCESSING
+            _k32.SetConsoleMode(_h, _mode.value | 0x0004)
+    except Exception:
+        COLOR_ENABLED = False
+
+RESET = '\033[0m'
+BOLD = '\033[1m'
+DIM = '\033[2m'
+GREEN = '\033[32m'
+CYAN = '\033[36m'
+YELLOW = '\033[33m'
+RED = '\033[31m'
+BRAND = CYAN  # fixed banner / section-header color
+
+
+def c(text, *codes):
+    """Wrap text in ANSI codes when color is enabled, else return it unchanged."""
+    if not COLOR_ENABLED or not codes:
+        return text
+    return ''.join(codes) + text + RESET
+
+
+# Option A wordmark banner, printed once at startup in the fixed brand color.
+BANNER = r"""
+                 ____  _   _ ___ ____  _   _
+                |  _ \| | | |_ _/ ___|| | | |
+                | |_) | |_| || |\___ \| |_| |
+                |  __/|  _  || | ___) |  _  |
+                |_|   |_| |_|___|____/|_| |_|
+
+    _     _   _     _     _     __   __ _____  _____  ____
+   / \   | \ | |   / \   | |    \ \ / /|__  / | ____||  _ \
+  / _ \  |  \| |  / _ \  | |     \ V /   / /  |  _|  | |_) |
+ / ___ \ | |\  | / ___ \ | |___   | |   / /_  | |___ |  _ <
+/_/   \_\|_| \_|/_/   \_\|_____|  |_|  /____| |_____||_| \_\
+
+                            v3
+          local .eml phishing triage - runs 100% offline
+"""
+
+
+def print_banner():
+    print(c(BANNER, BRAND, BOLD))
+
+
+def _supported(ch):
+    try:
+        ch.encode(sys.stdout.encoding or 'ascii')
+        return True
+    except Exception:
+        return False
+
+
+# Prefer block glyphs; fall back to ASCII on consoles that can't encode them.
+_BAR_FULL = '█' if _supported('█') else '#'
+_BAR_EMPTY = '░' if _supported('░') else '-'
+
+
+def risk_meter(score, color, cells=10):
+    """Render a fixed-width severity bar, e.g. [########..]."""
+    filled = max(0, min(score, cells))
+    bar = _BAR_FULL * filled + _BAR_EMPTY * (cells - filled)
+    return c('[' + bar + ']', color)
+
+
+def weight_color(w):
+    """Color a signal weight by severity."""
+    if w >= 4:
+        return RED
+    if w == 3:
+        return YELLOW
+    if w == 2:
+        return CYAN
+    return DIM
+
+
 # Refuse to load absurdly large files — a multi-GB or MIME-bomb .eml would
 # otherwise exhaust memory since the whole file and every body part are read in.
 MAX_FILE_BYTES = 25 * 1024 * 1024  # 25 MB
@@ -436,54 +536,93 @@ def analyze(path):
     return findings, info, decoded, pp, pp_flagged
 
 
-def report(findings, info, decoded, pp, pp_flagged):
-    print("\n=== HEADER SUMMARY ===")
+def _hdr(title):
+    return c(f"=== {title} ===", BRAND, BOLD)
+
+
+def report(findings, info, decoded, pp, pp_flagged, quiet=False, verbose=False):
+    score = sum(w for w, _ in findings)
+
+    if score >= 6:
+        verdict, vcolor = "HIGH — strong phishing indicators", RED
+    elif score >= 3:
+        verdict, vcolor = "MEDIUM — suspicious, investigate further", YELLOW
+    elif score >= 1:
+        verdict, vcolor = "LOW — minor signals, likely benign but verify", CYAN
+    else:
+        verdict, vcolor = "MINIMAL — no scored signals", GREEN
+
+    meter = risk_meter(score, vcolor)
+    verdict_line = (f"=== RISK SCORE: {score}  {meter}  "
+                    f"{c(verdict, vcolor, BOLD)} ===")
+
+    # --quiet: just the bottom line — score, meter, verdict.
+    if quiet:
+        print(verdict_line)
+        return
+
+    print("\n" + _hdr("HEADER SUMMARY"))
     for line in info:
         print("  " + sanitize(line))
 
-    print("\n=== LINKS (Proofpoint-decoded) ===")
+    print("\n" + _hdr("LINKS (Proofpoint-decoded)"))
     if decoded:
-        for d in decoded[:25]:
+        # --verbose lifts the 25-link display cap so nothing is hidden.
+        shown = decoded if verbose else decoded[:25]
+        for d in shown:
             print("  -> " + sanitize(d))
+        if not verbose and len(decoded) > 25:
+            print(c(f"  ... +{len(decoded) - 25} more (use --verbose to show all)", DIM))
     else:
         print("  (no links found)")
 
-    score = sum(w for w, _ in findings)
-    print("\n=== SIGNALS ===")
+    print("\n" + _hdr("SIGNALS"))
     if not findings:
         print("  (no scored signals fired)")
     for w, desc in findings:
-        print(f"  [+{w}] {sanitize(desc)}")
+        print(f"  {c(f'[+{w}]', weight_color(w), BOLD)} {sanitize(desc)}")
 
-    if score >= 6:
-        verdict = "HIGH — strong phishing indicators"
-    elif score >= 3:
-        verdict = "MEDIUM — suspicious, investigate further"
-    elif score >= 1:
-        verdict = "LOW — minor signals, likely benign but verify"
-    else:
-        verdict = "MINIMAL — no scored signals"
-
-    print(f"\n=== RISK SCORE: {score}  ->  {verdict} ===")
+    print("\n" + verdict_line)
 
     if pp:
         print("\nProofpoint detected: raw SPF/DKIM/DMARC fails scored LOW (they")
         print("break on clean mail here). " + (
             "PPS flagged this — weight heavily." if pp_flagged
             else "PPS did not flag it (context)."))
-    print("\nNote: content signals (greetings, urgency, phrasing) are SOFT —")
-    print("modern AI-written phishing has clean grammar and personalized")
-    print("greetings. Your strongest evidence is the decoded link destinations,")
-    print("link-text/href mismatches, and Proofpoint's own verdict. Triage aid")
-    print("only — you make the call.")
+    print(c("\nNote: content signals (greetings, urgency, phrasing) are SOFT —", DIM))
+    print(c("modern AI-written phishing has clean grammar and personalized", DIM))
+    print(c("greetings. Your strongest evidence is the decoded link destinations,", DIM))
+    print(c("link-text/href mismatches, and Proofpoint's own verdict. Triage aid", DIM))
+    print(c("only — you make the call.", DIM))
+
+
+USAGE = "Usage: python3 phish-analyzer.py [-q|--quiet] [-v|--verbose] <email.eml>"
 
 
 def main():
-    if len(sys.argv) < 2:
-        print("Usage: python3 phish-analyzer.py <email.eml>")
+    quiet = verbose = False
+    paths = []
+    for arg in sys.argv[1:]:
+        if arg in ('-q', '--quiet'):
+            quiet = True
+        elif arg in ('-v', '--verbose'):
+            verbose = True
+        else:
+            paths.append(arg)
+
+    if quiet and verbose:
+        print("[ERROR] --quiet and --verbose are mutually exclusive.")
         sys.exit(1)
-    path = sys.argv[1]
-    print(f"Analyzing {path}...")
+    if not paths:
+        print(USAGE)
+        sys.exit(1)
+    path = paths[0]
+
+    # Banner and progress chatter are decoration; --quiet suppresses both so the
+    # output is a single machine-friendly verdict line.
+    if not quiet:
+        print_banner()
+        print(f"Analyzing {path}...")
     try:
         findings, info, decoded, pp, pp_flagged = analyze(path)
     except FileNotFoundError:
@@ -496,7 +635,7 @@ def main():
     except Exception as exc:
         print(f"[ERROR] Failed to parse email: {type(exc).__name__}: {exc}")
         sys.exit(1)
-    report(findings, info, decoded, pp, pp_flagged)
+    report(findings, info, decoded, pp, pp_flagged, quiet=quiet, verbose=verbose)
 
 
 if __name__ == '__main__':
