@@ -10,6 +10,9 @@ Header / auth (strongest, deterministic signals):
     (URL rewriting breaks DKIM; relay hop breaks SPF/DMARC on clean mail).
   - Reads ALL Authentication-Results headers, not just the first.
   - Uses Proofpoint's own X-Proofpoint verdict as a primary signal.
+  - Compares domains at the registrable (eTLD+1) level using a bundled Public
+    Suffix List, so Reply-To/Return-Path/link mismatches reason about real
+    organizational boundaries (e.g. distinguishes co.uk second-level domains).
 
 Content (softer signals — see the note at the bottom of the output):
   - Link TEXT vs actual HREF mismatch (e.g. shows paypal.com, goes to evil.ru).
@@ -85,9 +88,97 @@ def sanitize(s):
     return ''.join(c if c.isprintable() else '?' for c in s)
 
 
+def _normalize(name):
+    """Lowercase a domain/rule and IDNA-encode any non-ASCII labels to punycode,
+    so unicode PSL entries and xn-- hostnames compare on the same footing."""
+    out = []
+    for lab in name.split('.'):
+        if lab and lab != '*' and not lab.isascii():
+            try:
+                lab = lab.encode('idna').decode('ascii')
+            except Exception:
+                pass
+        out.append(lab.lower())
+    return '.'.join(out)
+
+
+def _init_psl(path):
+    """Load the bundled Public Suffix List. Returns (rules, exceptions, warning).
+
+    Never raises: if the .dat file is missing or unreadable, returns empty sets
+    plus a warning string so the tool degrades to a last-two-labels heuristic
+    instead of hard-failing.
+    """
+    rules, exceptions = set(), set()
+    try:
+        with open(path, encoding='utf-8') as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith('//'):
+                    continue
+                if line.startswith('!'):
+                    exceptions.add(_normalize(line[1:]))
+                else:
+                    rules.add(_normalize(line))
+    except OSError as exc:
+        return set(), set(), (
+            f"[WARN] Public Suffix List unavailable ({exc}); "
+            "domain comparison fell back to a simple last-two-labels heuristic.")
+    return rules, exceptions, None
+
+
+_PSL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         'public_suffix_list.dat')
+_PSL_RULES, _PSL_EXCEPTIONS, PSL_WARNING = _init_psl(_PSL_PATH)
+
+
+def registrable_domain(host):
+    """Return the registrable domain (eTLD+1) of a host, per the Public Suffix
+    List — e.g. 'a.b.example.co.uk' -> 'example.co.uk'. Returns '' if the host is
+    itself a public suffix, and falls back to the last two labels if the PSL
+    failed to load."""
+    host = host.strip().strip('.')
+    if not host:
+        return ''
+    if not _PSL_RULES:
+        labels = host.lower().split('.')
+        return '.'.join(labels[-2:]) if len(labels) >= 2 else host.lower()
+
+    labels = _normalize(host).split('.')
+    n = len(labels)
+
+    # Exception rules (e.g. !www.ck) take priority over everything else.
+    for i in range(n):
+        if '.'.join(labels[i:]) in _PSL_EXCEPTIONS:
+            # Public suffix is the matched rule minus its leftmost label;
+            # registrable domain is that suffix plus one more label.
+            return '.'.join(labels[i:])
+
+    # Otherwise the longest matching normal or wildcard rule wins.
+    best = 0
+    for i in range(n):
+        seg = labels[i:]
+        if '.'.join(seg) in _PSL_RULES:
+            best = max(best, len(seg))
+        elif '.'.join(['*'] + seg[1:]) in _PSL_RULES:
+            best = max(best, len(seg))
+    if best == 0:
+        best = 1  # default "*" rule: the public suffix is the rightmost label
+    if best >= n:
+        return ''  # host is itself a public suffix (no registrable part)
+    return '.'.join(labels[n - best - 1:])
+
+
 def same_domain_family(a, b):
-    """True if a and b are the same domain or one is a direct subdomain of the other."""
-    return a == b or a.endswith('.' + b) or b.endswith('.' + a)
+    """True if a and b share the same registrable domain (eTLD+1).
+
+    This is the organizational-identity test behind every domain-mismatch
+    signal: 'mail.corp.com' and 'corp.com' match; 'corp.com' and a lookalike
+    'corp.com.evil.ru' do not."""
+    if not a or not b:
+        return False
+    ra, rb = registrable_domain(a), registrable_domain(b)
+    return bool(ra) and ra == rb
 
 
 def get_domain(addr):
@@ -105,10 +196,12 @@ def dest_domain(url):
     back to the leading path segment so destination checks still work.
     """
     parsed = urllib.parse.urlparse(url)
-    host = parsed.netloc
+    host = parsed.hostname  # already lowercased, strips any userinfo and :port
     if not host and parsed.path:
-        host = parsed.path.split('/', 1)[0]
-    return host.lower()
+        # Scheme-less (often from v3 decoding): take the leading path segment,
+        # dropping any userinfo (@) or port (:) that may ride along.
+        host = parsed.path.split('/', 1)[0].split('@')[-1].split(':', 1)[0]
+    return (host or '').lower()
 
 
 def decode_proofpoint(url):
@@ -196,6 +289,8 @@ def analyze(path):
 
     findings = []   # (weight, description)
     info = []
+    if PSL_WARNING:
+        info.append(PSL_WARNING)
     pp = proofpoint_in_path(msg)
 
     frm = str(msg.get('From', ''))
@@ -229,9 +324,11 @@ def analyze(path):
                 findings.append((4, f"Proofpoint itself flagged this message ({h})"))
                 pp_flagged = True
 
-    if reply_dom and from_dom and reply_dom != from_dom:
+    # Compared at the registrable-domain (eTLD+1) level, so a legitimate
+    # subdomain split like reply at mail.corp.com vs From corp.com is not flagged.
+    if reply_dom and from_dom and not same_domain_family(reply_dom, from_dom):
         findings.append((2, f"Reply-To domain ({reply_dom}) != From domain ({from_dom})"))
-    if rp_dom and from_dom and rp_dom != from_dom:
+    if rp_dom and from_dom and not same_domain_family(rp_dom, from_dom):
         findings.append((2, f"Return-Path domain ({rp_dom}) != From domain ({from_dom})"))
 
     # Only check display name when a distinct display name component is present;

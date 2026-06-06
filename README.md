@@ -15,7 +15,8 @@ Most email security tools either require cloud access, need API keys, or only te
 - **Proofpoint URL Defense decoding** — unwraps v2 and v3 redirect links to show the real destination
 - **Auth header analysis** — reads all `Authentication-Results` headers and scores SPF, DKIM, and DMARC failures; adjusts confidence automatically when Proofpoint is in the mail path (where URL rewriting legitimately breaks DKIM)
 - **Proofpoint verdict passthrough** — surfaces the `X-Proofpoint` verdict directly; a PPS flag is the single highest-weight signal
-- **Header mismatch detection** — flags Reply-To and Return-Path domains that differ from the From domain
+- **Header mismatch detection** — flags Reply-To and Return-Path domains that differ from the From domain, compared at the registrable-domain level so legitimate subdomain splits (`mail.corp.com` vs `corp.com`) don't false-positive
+- **Public Suffix List accuracy** — all domain comparisons use the registrable domain (eTLD+1) via a bundled PSL snapshot, so multi-label suffixes (`co.uk`, `com.au`) are handled correctly and cousin domains sharing a suffix (`servicea.gov.uk` vs `serviceb.gov.uk`) are recognised as different organisations
 - **Display name impersonation** — catches display names claiming to be IT, security, Microsoft, PayPal, etc. when the actual sending domain doesn't match
 - **Link text vs. href mismatch** — detects the classic trick of showing `paypal.com` in anchor text while the href goes elsewhere
 - **Credential-harvesting phrase detection** — matches common lure phrases ("verify your account", "update your credentials", etc.)
@@ -28,6 +29,7 @@ Most email security tools either require cloud access, need API keys, or only te
 
 - Python 3.6 or later
 - No third-party packages — standard library only
+- `public_suffix_list.dat` (bundled in this repo) must sit next to `phish-analyzer.py` for accurate eTLD+1 comparison. If it's missing, the tool still runs but falls back to a simpler last-two-labels heuristic and prints a one-line warning.
 
 ---
 
@@ -38,7 +40,7 @@ git clone https://github.com/RyanSecEng/phish-analyzer.git
 cd phish-analyzer
 ```
 
-No install step needed. Run directly with Python.
+No install step needed. Run directly with Python — the bundled `public_suffix_list.dat` ships with the clone, so there's nothing else to fetch and no network access required at runtime.
 
 To save an email as `.eml`:
 - **Outlook**: File → Save As → Outlook Message Format or `.eml`
@@ -128,7 +130,7 @@ Proofpoint-aware mode automatically reduces SPF, DKIM, and DMARC weights to +1 w
 - **Links are decoded, not fetched** — no DNS lookups, no page rendering, no sandbox. A convincing domain name (`login.microsoftonline.com.verify-account.ru`) requires human judgment to evaluate.
 - **Basic HTML parser** — heavily obfuscated HTML (CSS-hidden text, zero-font-size tricks, Unicode lookalikes) may not be detected.
 - **Attachments are not analyzed** — only the email body and headers are inspected. Malicious payloads in PDF or Office attachments are out of scope.
-- **No public suffix awareness** — `same_domain_family()` uses suffix matching rather than a full public suffix list, so unusual registry structures (e.g., `co.uk` second-level domains) may produce occasional mismatches.
+- **PSL snapshot ages** — domain comparison uses a point-in-time copy of the Public Suffix List (`public_suffix_list.dat`). Newly delegated suffixes added after the snapshot won't be recognised until you refresh it (see *Maintenance* below).
 - **Single-file input only** — no batch mode; run once per email.
 
 ---
@@ -138,10 +140,27 @@ Proofpoint-aware mode automatically reduces SPF, DKIM, and DMARC weights to +1 w
 - Batch mode: analyze a directory of `.eml` files and produce a summary table
 - JSON output flag for piping results into a SIEM or ticketing system
 - Optional VirusTotal / URLhaus reputation lookup for decoded link destinations
-- Public suffix list (PSL) integration for accurate eTLD+1 domain comparison
 - Attachment hashing (MD5/SHA256) for known-malware lookups
 - Configurable weight overrides via a config file
 - MIME attachment type inventory (flags unexpected executables or macros)
+
+---
+
+## Maintenance
+
+### Updating the Public Suffix List
+
+The bundled `public_suffix_list.dat` is a snapshot from [publicsuffix.org](https://publicsuffix.org/list/). It changes slowly, but refresh it every few months so newly delegated suffixes are recognised. Re-download the official file, replacing the one in the repo:
+
+```
+# PowerShell
+Invoke-WebRequest -Uri https://publicsuffix.org/list/public_suffix_list.dat -OutFile public_suffix_list.dat
+
+# curl
+curl -o public_suffix_list.dat https://publicsuffix.org/list/public_suffix_list.dat
+```
+
+The file's header records the `VERSION` date of the snapshot. No code changes are needed — the analyzer reads the new file on its next run. Only pull this list from the official URL above; mirrors are not guaranteed to be supported.
 
 ---
 
