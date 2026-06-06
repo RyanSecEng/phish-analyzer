@@ -24,11 +24,16 @@ Usage:
   python3 phish-analyzer.py <email.eml>
 """
 import email
+import os
 import re
 import sys
 import urllib.parse
 from email import policy
 from html.parser import HTMLParser
+
+# Refuse to load absurdly large files — a multi-GB or MIME-bomb .eml would
+# otherwise exhaust memory since the whole file and every body part are read in.
+MAX_FILE_BYTES = 25 * 1024 * 1024  # 25 MB
 
 FREEMAIL = {'gmail.com', 'yahoo.com', 'outlook.com', 'hotmail.com',
             'aol.com', 'icloud.com', 'proton.me', 'protonmail.com'}
@@ -58,7 +63,9 @@ PP_BAD_TOKENS = ['rule=spam', 'rule=phish', 'rule=malware', 'rule=impostor',
 
 SKIP_TAGS = {'script', 'style'}
 
-URL_RE = re.compile(r'https?://[^\s"\'<>)]+', re.IGNORECASE)
+# Exclude control bytes (incl. the ESC byte 0x1b) so terminal escape sequences
+# can't be smuggled into a "URL" and later printed unsanitized.
+URL_RE = re.compile(r'https?://[^\s"\'<>)\x00-\x1f\x7f]+', re.IGNORECASE)
 DOMAIN_RE = re.compile(r'@([A-Za-z0-9.-]+\.[A-Za-z]{2,})')
 TEXT_DOMAIN_RE = re.compile(
     r'\b([a-z0-9][a-z0-9-]+\.(?:com|net|org|io|gov|edu|co|us|info|biz|ru|cn|xyz|top|live|app'
@@ -88,6 +95,20 @@ def get_domain(addr):
         return ''
     m = DOMAIN_RE.search(addr)
     return m.group(1).lower() if m else ''
+
+
+def dest_domain(url):
+    """Best-effort host for a (possibly scheme-less) URL.
+
+    Proofpoint v3 decoding can yield a URL without an http(s):// scheme, in
+    which case urlparse() puts everything in .path and .netloc is empty. Fall
+    back to the leading path segment so destination checks still work.
+    """
+    parsed = urllib.parse.urlparse(url)
+    host = parsed.netloc
+    if not host and parsed.path:
+        host = parsed.path.split('/', 1)[0]
+    return host.lower()
 
 
 def decode_proofpoint(url):
@@ -167,6 +188,9 @@ def domain_in_text(text):
 
 
 def analyze(path):
+    size = os.path.getsize(path)
+    if size > MAX_FILE_BYTES:
+        raise ValueError(f"file too large to analyze ({size} bytes, limit {MAX_FILE_BYTES})")
     with open(path, 'rb') as fh:
         msg = email.message_from_binary_file(fh, policy=policy.default)
 
@@ -214,13 +238,17 @@ def analyze(path):
     # bare addresses like support@company.com have no display name to evaluate.
     if '<' in frm:
         display = frm.split('<')[0].strip().lower()
-        if display and any(term in display for term in IMPERSONATION_TERMS):
+        # Match whole words only so short terms ('it', 'hr') don't fire inside
+        # unrelated words ('Smith', 'unit').
+        matched = [t for t in (term.strip() for term in IMPERSONATION_TERMS)
+                   if re.search(r'\b' + re.escape(t) + r'\b', display)]
+        if matched:
             if from_dom in FREEMAIL:
                 findings.append((3, f"Authority/brand display name from freemail ({from_dom})"))
             else:
-                for term in IMPERSONATION_TERMS:
-                    if term.strip() in display and term.strip() not in from_dom:
-                        findings.append((3, f"Display name implies '{term.strip()}' but domain is {from_dom}"))
+                for term in matched:
+                    if term not in from_dom:
+                        findings.append((3, f"Display name implies '{term}' but domain is {from_dom}"))
                         break
 
     if auth_headers:
@@ -276,7 +304,7 @@ def analyze(path):
         if real not in seen_decoded:
             decoded.append(real)
             seen_decoded.add(real)
-        real_dom = urllib.parse.urlparse(real).netloc.lower()
+        real_dom = dest_domain(real)
         if real_dom and from_dom and not same_domain_family(from_dom, real_dom):
             if real_dom not in flagged_dest:
                 findings.append((2, f"Link goes to {real_dom}, not sender domain {from_dom}"))
@@ -286,7 +314,7 @@ def analyze(path):
     seen_mismatch = set()
     for href, text in parser.links:
         real = decode_proofpoint(href)
-        real_dom = urllib.parse.urlparse(real).netloc.lower()
+        real_dom = dest_domain(real)
         claimed = domain_in_text(text)
         if claimed and real_dom and not same_domain_family(claimed, real_dom):
             key = (claimed, real_dom)
@@ -314,7 +342,7 @@ def analyze(path):
 def report(findings, info, decoded, pp, pp_flagged):
     print("\n=== HEADER SUMMARY ===")
     for line in info:
-        print("  " + line)
+        print("  " + sanitize(line))
 
     print("\n=== LINKS (Proofpoint-decoded) ===")
     if decoded:
@@ -328,7 +356,7 @@ def report(findings, info, decoded, pp, pp_flagged):
     if not findings:
         print("  (no scored signals fired)")
     for w, desc in findings:
-        print(f"  [+{w}] {desc}")
+        print(f"  [+{w}] {sanitize(desc)}")
 
     if score >= 6:
         verdict = "HIGH — strong phishing indicators"
@@ -364,6 +392,12 @@ def main():
     except FileNotFoundError:
         print(f"[ERROR] File not found: {path}")
         print("Fail loud, never fail silent.")
+        sys.exit(1)
+    except (OSError, ValueError) as exc:
+        print(f"[ERROR] Could not read {path}: {exc}")
+        sys.exit(1)
+    except Exception as exc:
+        print(f"[ERROR] Failed to parse email: {type(exc).__name__}: {exc}")
         sys.exit(1)
     report(findings, info, decoded, pp, pp_flagged)
 

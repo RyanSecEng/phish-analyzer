@@ -123,7 +123,7 @@ Proofpoint-aware mode automatically reduces SPF, DKIM, and DMARC weights to +1 w
 
 ## Known Limitations
 
-- **Proofpoint v2 edge case** — the v2 decoder uses a hex-pair heuristic (`-XX` → `%XX`) to avoid corrupting literal hyphens in domain names. A rare domain like `my-20px.com` would be mis-decoded because `-20` looks like a percent-encoded space. URLs produced by actual Proofpoint wrapping are not affected.
+- **Proofpoint v2 hex heuristic** — the v2 decoder reverses Proofpoint's `%`→`-` substitution by turning any `-XX` (where `XX` are two hex digits, `0-9`/`a-f`) back into `%XX`. This preserves most literal hyphens, but a hyphen followed by two hex characters in a real link will be mis-decoded — e.g. `support-365.com` or `route-1a.example` get garbled because `-36`/`-1a` look like percent-encodings. This affects more than just rare domains; treat a v2-decoded destination containing a hyphen-plus-digits segment with suspicion and verify it manually. URLs without such sequences, and the common case of Proofpoint-wrapped links, decode correctly.
 - **Content signals are noisy** — urgency words, generic greetings, and credential phrases fire on legitimate bulk mail (password reset emails, bank statements, IT notifications). Treat them as soft context, not verdicts.
 - **Links are decoded, not fetched** — no DNS lookups, no page rendering, no sandbox. A convincing domain name (`login.microsoftonline.com.verify-account.ru`) requires human judgment to evaluate.
 - **Basic HTML parser** — heavily obfuscated HTML (CSS-hidden text, zero-font-size tricks, Unicode lookalikes) may not be detected.
