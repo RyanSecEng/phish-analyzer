@@ -630,10 +630,10 @@ def main():
         print("Fail loud, never fail silent.")
         sys.exit(1)
     except (OSError, ValueError) as exc:
-        print(f"[ERROR] Could not read {path}: {exc}")
+        print(f"[ERROR] Could not read {path}: {sanitize(str(exc))}")
         sys.exit(1)
     except Exception as exc:
-        print(f"[ERROR] Failed to parse email: {type(exc).__name__}: {exc}")
+        print(f"[ERROR] Failed to parse email: {type(exc).__name__}: {sanitize(str(exc))}")
         sys.exit(1)
     report(findings, info, decoded, pp, pp_flagged, quiet=quiet, verbose=verbose)
 
