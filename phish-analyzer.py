@@ -1,30 +1,27 @@
 """
-phish-analyzer.py — parses a saved email and scores it for phishing signals.
+phish-analyzer.py - parse a saved email and score it for phishing signals.
 
-PROOFPOINT-AWARE + CONTENT ANALYSIS (v3):
-
-Header / auth (strongest, deterministic signals):
+Header / auth signals (the deterministic ones):
   - Detects Proofpoint in the mail path.
-  - Decodes URL Defense links (v2/v3) to reveal the REAL destination.
-  - SPF/DKIM/DMARC failures scored LOW-confidence when Proofpoint is present
-    (URL rewriting breaks DKIM; relay hop breaks SPF/DMARC on clean mail).
-  - Reads ALL Authentication-Results headers, not just the first.
+  - Decodes URL Defense links (v2/v3) to reveal the real destination.
+  - SPF/DKIM/DMARC failures are scored low-confidence when Proofpoint is present,
+    since URL rewriting breaks DKIM and the relay hop breaks SPF/DMARC on clean mail.
+  - Reads all Authentication-Results headers, not just the first.
   - Uses Proofpoint's own X-Proofpoint verdict as a primary signal.
   - Compares domains at the registrable (eTLD+1) level using a bundled Public
     Suffix List, so Reply-To/Return-Path/link mismatches reason about real
-    organizational boundaries (e.g. distinguishes co.uk second-level domains).
+    organizational boundaries.
 
-Content (softer signals — see the note at the bottom of the output):
-  - Link TEXT vs actual HREF mismatch (e.g. shows paypal.com, goes to evil.ru).
-  - Credential-harvesting phrases ("verify your account", "confirm password").
-  - Generic greetings ("Dear Customer" instead of your name).
-  - Urgency/pressure language in the body (not just the subject).
+Content signals (softer):
+  - Link text vs actual href mismatch.
+  - Credential-harvesting phrases.
+  - Generic greetings.
+  - Urgency/pressure language in the body.
 
-TRIAGE AID, not a verdict. A human analyst makes the final call.
-Runs fully local. Standard library only.
+A triage aid, not a verdict. Runs fully local, standard library only.
 
 Usage:
-  python3 phish-analyzer.py <email.eml>
+  python phish-analyzer.py <email.eml>
 """
 import email
 import os
@@ -34,9 +31,7 @@ import urllib.parse
 from email import policy
 from html.parser import HTMLParser
 
-# Force UTF-8 output so box-drawing glyphs and em-dashes survive on consoles
-# whose default code page (e.g. Windows cp1252) can't encode them — otherwise
-# piped/redirected output raises UnicodeEncodeError mid-report.
+# Force UTF-8 so box-drawing glyphs survive on cp1252 (Windows) consoles.
 try:
     sys.stdout.reconfigure(encoding='utf-8')
     sys.stderr.reconfigure(encoding='utf-8')
@@ -44,14 +39,11 @@ except Exception:
     pass
 
 # ---------- TERMINAL COLOR SUPPORT ----------
-# Color is emitted only to a real interactive terminal. It is suppressed when
-# output is piped/redirected or when NO_COLOR is set (https://no-color.org/), so
-# logs, SIEM pipelines, and CI captures stay clean and parseable.
+# Color only to a real terminal; off when piped/redirected or NO_COLOR is set.
 COLOR_ENABLED = sys.stdout.isatty() and os.environ.get('NO_COLOR') is None
 
 if COLOR_ENABLED and os.name == 'nt':
-    # Enable ANSI/VT processing on Windows consoles (cmd.exe, older hosts);
-    # Windows Terminal already supports it, but this makes plain consoles work.
+    # Enable ANSI/VT processing on plain Windows consoles (cmd.exe, older hosts).
     try:
         import ctypes
         _k32 = ctypes.windll.kernel32
@@ -70,17 +62,15 @@ GREEN = '\033[32m'
 CYAN = '\033[36m'
 YELLOW = '\033[33m'
 RED = '\033[31m'
-BRAND = CYAN  # fixed banner / section-header color
+BRAND = CYAN
 
 
 def c(text, *codes):
-    """Wrap text in ANSI codes when color is enabled, else return it unchanged."""
     if not COLOR_ENABLED or not codes:
         return text
     return ''.join(codes) + text + RESET
 
 
-# Option A wordmark banner, printed once at startup in the fixed brand color.
 BANNER = r"""
                  ____  _   _ ___ ____  _   _
                 |  _ \| | | |_ _/ ___|| | | |
@@ -94,7 +84,6 @@ BANNER = r"""
  / ___ \ | |\  | / ___ \ | |___   | |   / /_  | |___ |  _ <
 /_/   \_\|_| \_|/_/   \_\|_____|  |_|  /____| |_____||_| \_\
 
-                            v3
           local .eml phishing triage - runs 100% offline
 """
 
@@ -117,14 +106,12 @@ _BAR_EMPTY = '░' if _supported('░') else '-'
 
 
 def risk_meter(score, color, cells=10):
-    """Render a fixed-width severity bar, e.g. [########..]."""
     filled = max(0, min(score, cells))
     bar = _BAR_FULL * filled + _BAR_EMPTY * (cells - filled)
     return c('[' + bar + ']', color)
 
 
 def weight_color(w):
-    """Color a signal weight by severity."""
     if w >= 4:
         return RED
     if w == 3:
@@ -134,8 +121,8 @@ def weight_color(w):
     return DIM
 
 
-# Refuse to load absurdly large files — a multi-GB or MIME-bomb .eml would
-# otherwise exhaust memory since the whole file and every body part are read in.
+# Cap input size; the whole file and every body part get read into memory, so a
+# giant or MIME-bomb .eml could blow it up.
 MAX_FILE_BYTES = 25 * 1024 * 1024  # 25 MB
 
 FREEMAIL = {'gmail.com', 'yahoo.com', 'outlook.com', 'hotmail.com',
@@ -174,11 +161,11 @@ TEXT_DOMAIN_RE = re.compile(
     r'\b([a-z0-9][a-z0-9-]+\.(?:com|net|org|io|gov|edu|co|us|info|biz|ru|cn|xyz|top|live|app'
     r'|click|work|online|shop|site|win|club|bond|digital|link|email|tech|store|space))\b')
 
-# Matches -XX where XX are hex digits — used to reverse Proofpoint v2's %→- substitution
+# Matches -XX where XX are hex digits, used to reverse Proofpoint v2's %->- substitution
 # without corrupting literal hyphens (e.g. my-company.com stays intact).
 _PP_V2_HEX_RE = re.compile(r'-([0-9A-Fa-f]{2})')
 
-# ANSI escape sequences that could manipulate terminal output when decoded URLs are printed.
+# ANSI escape sequences that could manipulate the terminal when decoded URLs print.
 _ANSI_RE = re.compile(r'\x1b(?:\[[0-9;]*[a-zA-Z]|\].*?(?:\x07|\x1b\\))')
 
 
@@ -205,9 +192,9 @@ def _normalize(name):
 def _init_psl(path):
     """Load the bundled Public Suffix List. Returns (rules, exceptions, warning).
 
-    Never raises: if the .dat file is missing or unreadable, returns empty sets
-    plus a warning string so the tool degrades to a last-two-labels heuristic
-    instead of hard-failing.
+    Never raises: a missing or unreadable .dat file yields empty sets plus a
+    warning string, so the tool degrades to a last-two-labels heuristic instead
+    of hard-failing.
     """
     rules, exceptions = set(), set()
     try:
@@ -233,8 +220,8 @@ _PSL_RULES, _PSL_EXCEPTIONS, PSL_WARNING = _init_psl(_PSL_PATH)
 
 
 def registrable_domain(host):
-    """Return the registrable domain (eTLD+1) of a host, per the Public Suffix
-    List — e.g. 'a.b.example.co.uk' -> 'example.co.uk'. Returns '' if the host is
+    """Return the registrable domain (eTLD+1) of a host per the Public Suffix
+    List, e.g. 'a.b.example.co.uk' -> 'example.co.uk'. Returns '' if the host is
     itself a public suffix, and falls back to the last two labels if the PSL
     failed to load."""
     host = host.strip().strip('.')
@@ -250,8 +237,6 @@ def registrable_domain(host):
     # Exception rules (e.g. !www.ck) take priority over everything else.
     for i in range(n):
         if '.'.join(labels[i:]) in _PSL_EXCEPTIONS:
-            # Public suffix is the matched rule minus its leftmost label;
-            # registrable domain is that suffix plus one more label.
             return '.'.join(labels[i:])
 
     # Otherwise the longest matching normal or wildcard rule wins.
@@ -263,18 +248,15 @@ def registrable_domain(host):
         elif '.'.join(['*'] + seg[1:]) in _PSL_RULES:
             best = max(best, len(seg))
     if best == 0:
-        best = 1  # default "*" rule: the public suffix is the rightmost label
+        best = 1  # default "*" rule: public suffix is the rightmost label
     if best >= n:
-        return ''  # host is itself a public suffix (no registrable part)
+        return ''  # host is itself a public suffix
     return '.'.join(labels[n - best - 1:])
 
 
 def same_domain_family(a, b):
-    """True if a and b share the same registrable domain (eTLD+1).
-
-    This is the organizational-identity test behind every domain-mismatch
-    signal: 'mail.corp.com' and 'corp.com' match; 'corp.com' and a lookalike
-    'corp.com.evil.ru' do not."""
+    """True if a and b share the same registrable domain (eTLD+1), e.g.
+    'mail.corp.com' and 'corp.com' match but 'corp.com.evil.ru' does not."""
     if not a or not b:
         return False
     ra, rb = registrable_domain(a), registrable_domain(b)
@@ -291,15 +273,13 @@ def get_domain(addr):
 def dest_domain(url):
     """Best-effort host for a (possibly scheme-less) URL.
 
-    Proofpoint v3 decoding can yield a URL without an http(s):// scheme, in
-    which case urlparse() puts everything in .path and .netloc is empty. Fall
-    back to the leading path segment so destination checks still work.
+    Proofpoint v3 decoding can yield a URL without an http(s):// scheme, where
+    urlparse() puts everything in .path and .netloc is empty. Fall back to the
+    leading path segment so destination checks still work.
     """
     parsed = urllib.parse.urlparse(url)
-    host = parsed.hostname  # already lowercased, strips any userinfo and :port
+    host = parsed.hostname  # already lowercased, strips userinfo and :port
     if not host and parsed.path:
-        # Scheme-less (often from v3 decoding): take the leading path segment,
-        # dropping any userinfo (@) or port (:) that may ride along.
         host = parsed.path.split('/', 1)[0].split('@')[-1].split(':', 1)[0]
     return (host or '').lower()
 
@@ -310,9 +290,8 @@ def decode_proofpoint(url):
         try:
             q = urllib.parse.urlparse(url).query
             u = urllib.parse.parse_qs(q).get('u', [''])[0]
-            # Proofpoint v2 encodes % as - and / as _.  Reverse only the -XX sequences
-            # (which represent %XX percent-encoded chars) so literal hyphens in domain
-            # names and paths are not corrupted.
+            # v2 encodes % as - and / as _. Reverse only the -XX sequences (real
+            # percent-encodings) so literal hyphens in names/paths aren't corrupted.
             u = _PP_V2_HEX_RE.sub(r'%\1', u)
             u = u.replace('_', '/')
             return urllib.parse.unquote(u)
@@ -424,19 +403,15 @@ def analyze(path):
                 findings.append((4, f"Proofpoint itself flagged this message ({h})"))
                 pp_flagged = True
 
-    # Compared at the registrable-domain (eTLD+1) level, so a legitimate
-    # subdomain split like reply at mail.corp.com vs From corp.com is not flagged.
+    # eTLD+1 compare, so a legit mail.corp.com vs corp.com split isn't flagged.
     if reply_dom and from_dom and not same_domain_family(reply_dom, from_dom):
         findings.append((2, f"Reply-To domain ({reply_dom}) != From domain ({from_dom})"))
     if rp_dom and from_dom and not same_domain_family(rp_dom, from_dom):
         findings.append((2, f"Return-Path domain ({rp_dom}) != From domain ({from_dom})"))
 
-    # Only check display name when a distinct display name component is present;
-    # bare addresses like support@company.com have no display name to evaluate.
     if '<' in frm:
         display = frm.split('<')[0].strip().lower()
-        # Match whole words only so short terms ('it', 'hr') don't fire inside
-        # unrelated words ('Smith', 'unit').
+        # Whole-word match so short terms ('it', 'hr') don't fire inside words.
         matched = [t for t in (term.strip() for term in IMPERSONATION_TERMS)
                    if re.search(r'\b' + re.escape(t) + r'\b', display)]
         if matched:
@@ -450,12 +425,12 @@ def analyze(path):
 
     if auth_headers:
         spf_w, dkim_w, dmarc_w = (1, 1, 1) if pp else (2, 2, 3)
-        note = "  (LOW conf — Proofpoint may have broken this)" if pp else ""
+        note = "  (LOW conf - Proofpoint may have broken this)" if pp else ""
         if 'spf=fail' in all_auth or 'spf=softfail' in all_auth:
             findings.append((spf_w, "SPF failed" + note))
         if 'dkim=fail' in all_auth:
             findings.append((dkim_w, "DKIM failed" + (
-                "  (LOW conf — URL rewriting breaks DKIM body hash)" if pp else "")))
+                "  (LOW conf - URL rewriting breaks DKIM body hash)" if pp else "")))
         if 'dmarc=fail' in all_auth:
             findings.append((dmarc_w, "DMARC failed" + note))
     else:
@@ -507,7 +482,7 @@ def analyze(path):
                 findings.append((2, f"Link goes to {real_dom}, not sender domain {from_dom}"))
                 flagged_dest.add(real_dom)
 
-    # Link TEXT vs real HREF — the strongest content signal.
+    # Displayed link text vs the real href.
     seen_mismatch = set()
     for href, text in parser.links:
         real = decode_proofpoint(href)
@@ -519,7 +494,7 @@ def analyze(path):
                 findings.append((3, f"Link DISPLAYS '{claimed}' but actually goes to '{real_dom}'"))
                 seen_mismatch.add(key)
 
-    # ---------- CONTENT / LANGUAGE SIGNALS (softer) ----------
+    # ---------- CONTENT / LANGUAGE SIGNALS ----------
     for phrase in CRED_HARVEST:
         if phrase in visible:
             findings.append((2, f"Credential-harvesting phrase: '{phrase}'"))
@@ -544,19 +519,18 @@ def report(findings, info, decoded, pp, pp_flagged, quiet=False, verbose=False):
     score = sum(w for w, _ in findings)
 
     if score >= 6:
-        verdict, vcolor = "HIGH — strong phishing indicators", RED
+        verdict, vcolor = "HIGH - strong phishing indicators", RED
     elif score >= 3:
-        verdict, vcolor = "MEDIUM — suspicious, investigate further", YELLOW
+        verdict, vcolor = "MEDIUM - suspicious, investigate further", YELLOW
     elif score >= 1:
-        verdict, vcolor = "LOW — minor signals, likely benign but verify", CYAN
+        verdict, vcolor = "LOW - minor signals, likely benign but verify", CYAN
     else:
-        verdict, vcolor = "MINIMAL — no scored signals", GREEN
+        verdict, vcolor = "MINIMAL - no scored signals", GREEN
 
     meter = risk_meter(score, vcolor)
     verdict_line = (f"=== RISK SCORE: {score}  {meter}  "
                     f"{c(verdict, vcolor, BOLD)} ===")
 
-    # --quiet: just the bottom line — score, meter, verdict.
     if quiet:
         print(verdict_line)
         return
@@ -567,7 +541,6 @@ def report(findings, info, decoded, pp, pp_flagged, quiet=False, verbose=False):
 
     print("\n" + _hdr("LINKS (Proofpoint-decoded)"))
     if decoded:
-        # --verbose lifts the 25-link display cap so nothing is hidden.
         shown = decoded if verbose else decoded[:25]
         for d in shown:
             print("  -> " + sanitize(d))
@@ -587,16 +560,15 @@ def report(findings, info, decoded, pp, pp_flagged, quiet=False, verbose=False):
     if pp:
         print("\nProofpoint detected: raw SPF/DKIM/DMARC fails scored LOW (they")
         print("break on clean mail here). " + (
-            "PPS flagged this — weight heavily." if pp_flagged
+            "PPS flagged this - weight heavily." if pp_flagged
             else "PPS did not flag it (context)."))
-    print(c("\nNote: content signals (greetings, urgency, phrasing) are SOFT —", DIM))
+    print(c("\nNote: content signals (greetings, urgency, phrasing) are soft;", DIM))
     print(c("modern AI-written phishing has clean grammar and personalized", DIM))
-    print(c("greetings. Your strongest evidence is the decoded link destinations,", DIM))
-    print(c("link-text/href mismatches, and Proofpoint's own verdict. Triage aid", DIM))
-    print(c("only — you make the call.", DIM))
+    print(c("greetings. The strongest evidence is the decoded link destinations,", DIM))
+    print(c("link-text/href mismatches, and Proofpoint's own verdict.", DIM))
 
 
-USAGE = "Usage: python3 phish-analyzer.py [-q|--quiet] [-v|--verbose] <email.eml>"
+USAGE = "Usage: python phish-analyzer.py [-q|--quiet] [-v|--verbose] <email.eml>"
 
 
 def main():
@@ -618,8 +590,6 @@ def main():
         sys.exit(1)
     path = paths[0]
 
-    # Banner and progress chatter are decoration; --quiet suppresses both so the
-    # output is a single machine-friendly verdict line.
     if not quiet:
         print_banner()
         print(f"Analyzing {path}...")
@@ -627,7 +597,6 @@ def main():
         findings, info, decoded, pp, pp_flagged = analyze(path)
     except FileNotFoundError:
         print(f"[ERROR] File not found: {path}")
-        print("Fail loud, never fail silent.")
         sys.exit(1)
     except (OSError, ValueError) as exc:
         print(f"[ERROR] Could not read {path}: {sanitize(str(exc))}")

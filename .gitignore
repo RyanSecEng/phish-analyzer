@@ -1,4 +1,4 @@
-# Email files — NEVER commit real emails
+# Email files - NEVER commit real emails
 *.eml
 *.msg
 
