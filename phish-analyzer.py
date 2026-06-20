@@ -1,56 +1,43 @@
 """
-phish-analyzer.py - parse a saved email and score it for phishing signals.
+phish-analyzer.py - parse a saved .eml and score it for phishing signals.
 
-Header / auth signals (the deterministic ones):
-  - Detects Proofpoint in the mail path.
-  - Decodes URL Defense links (v2/v3) to reveal the real destination.
-  - SPF/DKIM/DMARC failures are scored low-confidence when Proofpoint is present,
-    since URL rewriting breaks DKIM and the relay hop breaks SPF/DMARC on clean mail.
-  - Reads all Authentication-Results headers, not just the first.
-  - Uses Proofpoint's own X-Proofpoint verdict as a primary signal.
-  - Compares domains at the registrable (eTLD+1) level using a bundled Public
-    Suffix List, so Reply-To/Return-Path/link mismatches reason about real
-    organizational boundaries.
+Looks at header/auth signals (Proofpoint detection, URL Defense decoding,
+SPF/DKIM/DMARC in context, domain mismatches at the registrable-domain level)
+and softer content signals (link text vs href, lure phrases, urgency).
 
-Content signals (softer):
-  - Link text vs actual href mismatch.
-  - Credential-harvesting phrases.
-  - Generic greetings.
-  - Urgency/pressure language in the body.
-
-A triage aid, not a verdict. Runs fully local, standard library only.
+A triage aid, not a verdict. Runs offline, standard library only.
 
 Usage:
-  python phish-analyzer.py <email.eml>
+  python phish-analyzer.py [-q|--quiet] [-v|--verbose] <email.eml>
 """
 import email
+import hashlib
 import os
 import re
 import sys
+import unicodedata
 import urllib.parse
 from email import policy
 from html.parser import HTMLParser
 
-# Force UTF-8 so box-drawing glyphs survive on cp1252 (Windows) consoles.
+# Force UTF-8 so box-drawing glyphs survive on Windows consoles.
 try:
     sys.stdout.reconfigure(encoding='utf-8')
     sys.stderr.reconfigure(encoding='utf-8')
 except Exception:
     pass
 
-# ---------- TERMINAL COLOR SUPPORT ----------
-# Color only to a real terminal; off when piped/redirected or NO_COLOR is set.
+# Color only on a real terminal; off when piped/redirected or NO_COLOR is set.
 COLOR_ENABLED = sys.stdout.isatty() and os.environ.get('NO_COLOR') is None
 
 if COLOR_ENABLED and os.name == 'nt':
-    # Enable ANSI/VT processing on plain Windows consoles (cmd.exe, older hosts).
+    # Turn on ANSI processing for older Windows consoles.
     try:
         import ctypes
         _k32 = ctypes.windll.kernel32
-        _h = _k32.GetStdHandle(-11)             # STD_OUTPUT_HANDLE
+        _h = _k32.GetStdHandle(-11)
         _mode = ctypes.c_uint32()
         if _k32.GetConsoleMode(_h, ctypes.byref(_mode)):
-            # 0x0004 = ENABLE_VIRTUAL_TERMINAL_PROCESSING
             _k32.SetConsoleMode(_h, _mode.value | 0x0004)
     except Exception:
         COLOR_ENABLED = False
@@ -100,7 +87,6 @@ def _supported(ch):
         return False
 
 
-# Prefer block glyphs; fall back to ASCII on consoles that can't encode them.
 _BAR_FULL = '█' if _supported('█') else '#'
 _BAR_EMPTY = '░' if _supported('░') else '-'
 
@@ -121,8 +107,7 @@ def weight_color(w):
     return DIM
 
 
-# Cap input size; the whole file and every body part get read into memory, so a
-# giant or MIME-bomb .eml could blow it up.
+# Cap input size; the whole file and every body part get read into memory.
 MAX_FILE_BYTES = 25 * 1024 * 1024  # 25 MB
 
 FREEMAIL = {'gmail.com', 'yahoo.com', 'outlook.com', 'hotmail.com',
@@ -151,22 +136,58 @@ CRED_HARVEST = ['confirm your password', 'verify your account', 'update your pay
 PP_BAD_TOKENS = ['rule=spam', 'rule=phish', 'rule=malware', 'rule=impostor',
                  'classifier=phish', 'classifier=malware', 'definitive=phish']
 
+# Brands phishing commonly imitates, used for typosquat/homoglyph comparison.
+BRANDS = ['microsoft.com', 'office365.com', 'outlook.com', 'paypal.com',
+          'amazon.com', 'apple.com', 'google.com', 'docusign.com',
+          'dropbox.com', 'linkedin.com', 'netflix.com', 'facebook.com',
+          'instagram.com', 'wellsfargo.com', 'chase.com', 'bankofamerica.com',
+          'americanexpress.com', 'coinbase.com', 'adobe.com']
+
+# Attachment extensions that run code on open, or that hide one.
+DANGEROUS_EXT = {'.exe', '.scr', '.com', '.pif', '.bat', '.cmd', '.js', '.jse',
+                 '.vbs', '.vbe', '.wsf', '.wsh', '.hta', '.jar', '.lnk', '.iso',
+                 '.img', '.msi', '.ps1', '.reg', '.cpl', '.msc', '.gadget'}
+MACRO_EXT = {'.docm', '.xlsm', '.pptm', '.dotm', '.xlam', '.xltm', '.potm'}
+ARCHIVE_EXT = {'.zip', '.rar', '.7z', '.ace', '.cab', '.gz', '.tar', '.iso'}
+
 SKIP_TAGS = {'script', 'style'}
 
-# Exclude control bytes (incl. the ESC byte 0x1b) so terminal escape sequences
-# can't be smuggled into a "URL" and later printed unsanitized.
+# Void/self-closing tags never get a close tag, so we don't push them on the
+# tag stack the HTML parser keeps for tracking hidden ancestors.
+VOID_TAGS = {'area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input',
+             'link', 'meta', 'param', 'source', 'track', 'wbr'}
+
+# Bound the tag stack so crafted, absurdly nested HTML can't blow up memory or
+# CPU. Real email HTML never nests anywhere near this deep.
+_MAX_NEST = 200
+
+# Exclude control bytes (including ESC) so escape sequences can't be smuggled
+# into a "URL" and printed later.
 URL_RE = re.compile(r'https?://[^\s"\'<>)\x00-\x1f\x7f]+', re.IGNORECASE)
 DOMAIN_RE = re.compile(r'@([A-Za-z0-9.-]+\.[A-Za-z]{2,})')
 TEXT_DOMAIN_RE = re.compile(
     r'\b([a-z0-9][a-z0-9-]+\.(?:com|net|org|io|gov|edu|co|us|info|biz|ru|cn|xyz|top|live|app'
     r'|click|work|online|shop|site|win|club|bond|digital|link|email|tech|store|space))\b')
 
-# Matches -XX where XX are hex digits, used to reverse Proofpoint v2's %->- substitution
-# without corrupting literal hyphens (e.g. my-company.com stays intact).
+# Reverse Proofpoint v2's %->- substitution without touching literal hyphens.
 _PP_V2_HEX_RE = re.compile(r'-([0-9A-Fa-f]{2})')
 
-# ANSI escape sequences that could manipulate the terminal when decoded URLs print.
 _ANSI_RE = re.compile(r'\x1b(?:\[[0-9;]*[a-zA-Z]|\].*?(?:\x07|\x1b\\))')
+
+# CSS that hides an element from the reader (used for poison/keyword-stuffed text).
+_HIDDEN_STYLE_RE = re.compile(
+    r'display\s*:\s*none|visibility\s*:\s*hidden|opacity\s*:\s*0(?![.\d])'
+    r'|font-size\s*:\s*0(?![.\d])|font-size\s*:\s*1px|max-height\s*:\s*0',
+    re.IGNORECASE)
+
+# Zero-width, soft-hyphen and bidi control characters that don't belong in body
+# text and are used to break up words or reverse displayed text.
+_ZW_RE = re.compile(
+    '[­​‌‍‎‏‪-‮⁠﻿]')
+
+# Common character swaps in typosquats, mapped back to what they imitate.
+_CONFUSE_MAP = str.maketrans({'0': 'o', '1': 'l', '3': 'e', '4': 'a',
+                              '5': 's', '7': 't', '$': 's', '@': 'a'})
 
 
 def sanitize(s):
@@ -176,8 +197,8 @@ def sanitize(s):
 
 
 def _normalize(name):
-    """Lowercase a domain/rule and IDNA-encode any non-ASCII labels to punycode,
-    so unicode PSL entries and xn-- hostnames compare on the same footing."""
+    """Lowercase a domain and punycode any non-ASCII labels, so unicode PSL
+    entries and xn-- hostnames compare on the same footing."""
     out = []
     for lab in name.split('.'):
         if lab and lab != '*' and not lab.isascii():
@@ -190,11 +211,10 @@ def _normalize(name):
 
 
 def _init_psl(path):
-    """Load the bundled Public Suffix List. Returns (rules, exceptions, warning).
+    """Load the bundled Public Suffix List into (rules, exceptions, warning).
 
-    Never raises: a missing or unreadable .dat file yields empty sets plus a
-    warning string, so the tool degrades to a last-two-labels heuristic instead
-    of hard-failing.
+    Never raises: a missing or unreadable file yields empty sets and a warning,
+    so the tool falls back to a last-two-labels heuristic instead of dying.
     """
     rules, exceptions = set(), set()
     try:
@@ -220,10 +240,9 @@ _PSL_RULES, _PSL_EXCEPTIONS, PSL_WARNING = _init_psl(_PSL_PATH)
 
 
 def registrable_domain(host):
-    """Return the registrable domain (eTLD+1) of a host per the Public Suffix
-    List, e.g. 'a.b.example.co.uk' -> 'example.co.uk'. Returns '' if the host is
-    itself a public suffix, and falls back to the last two labels if the PSL
-    failed to load."""
+    """Return the registrable domain (eTLD+1) of host, e.g.
+    'a.b.example.co.uk' -> 'example.co.uk'. Empty string if host is itself a
+    public suffix; falls back to the last two labels if the PSL didn't load."""
     host = host.strip().strip('.')
     if not host:
         return ''
@@ -234,7 +253,7 @@ def registrable_domain(host):
     labels = _normalize(host).split('.')
     n = len(labels)
 
-    # Exception rules (e.g. !www.ck) take priority over everything else.
+    # Exception rules (e.g. !www.ck) win over everything else.
     for i in range(n):
         if '.'.join(labels[i:]) in _PSL_EXCEPTIONS:
             return '.'.join(labels[i:])
@@ -248,19 +267,92 @@ def registrable_domain(host):
         elif '.'.join(['*'] + seg[1:]) in _PSL_RULES:
             best = max(best, len(seg))
     if best == 0:
-        best = 1  # default "*" rule: public suffix is the rightmost label
+        best = 1  # default rule: the rightmost label is the public suffix
     if best >= n:
-        return ''  # host is itself a public suffix
+        return ''
     return '.'.join(labels[n - best - 1:])
 
 
 def same_domain_family(a, b):
-    """True if a and b share the same registrable domain (eTLD+1), e.g.
-    'mail.corp.com' and 'corp.com' match but 'corp.com.evil.ru' does not."""
+    """True if a and b share the same registrable domain (eTLD+1)."""
     if not a or not b:
         return False
     ra, rb = registrable_domain(a), registrable_domain(b)
     return bool(ra) and ra == rb
+
+
+def _levenshtein(a, b):
+    if a == b:
+        return 0
+    if not a or not b:
+        return len(a) or len(b)
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1,
+                           prev[j - 1] + (ca != cb)))
+        prev = cur
+    return prev[-1]
+
+
+def _deconfuse(s):
+    """Undo common look-alike swaps (0->o, 1->l, rn->m ...) so a disguised
+    domain can be matched against the real thing it imitates."""
+    return s.translate(_CONFUSE_MAP).replace('rn', 'm').replace('vv', 'w')
+
+
+def typosquat_target(domain, sender_domain=''):
+    """If `domain` looks like a disguised version of a known brand or of the
+    sender's own domain, return the domain it imitates, else ''."""
+    if not domain:
+        return ''
+    targets = set(BRANDS)
+    if sender_domain:
+        targets.add(sender_domain)
+    if domain in targets:
+        return ''
+    dc = _deconfuse(domain)
+    if dc != domain and dc in targets:
+        return dc
+    # One-character typo away from the actual sender is a strong, specific tell.
+    if sender_domain and sender_domain != domain and len(sender_domain) >= 6:
+        if _levenshtein(domain, sender_domain) == 1:
+            return sender_domain
+    return ''
+
+
+def _label_script(label):
+    """Set of script families (LATIN, CYRILLIC, ...) used by the letters in a
+    single domain label."""
+    scripts = set()
+    for ch in label:
+        if not ch.isalpha():
+            continue
+        try:
+            scripts.add(unicodedata.name(ch).split(' ', 1)[0])
+        except ValueError:
+            scripts.add('?')
+    return scripts
+
+
+def idn_homograph(host):
+    """Return labels that mix Latin with a confusable script (e.g. a Cyrillic
+    'a' inside 'paypal'). Pure non-Latin IDNs are left alone; only mixed-script
+    labels, which are almost always spoofing, are reported."""
+    bad = []
+    confusable = {'CYRILLIC', 'GREEK', 'ARMENIAN', 'CHEROKEE'}
+    for label in host.split('.'):
+        decoded = label
+        if label.startswith('xn--'):
+            try:
+                decoded = label.encode('ascii').decode('idna')
+            except Exception:
+                decoded = label
+        scripts = _label_script(decoded)
+        if 'LATIN' in scripts and scripts & confusable:
+            bad.append(decoded)
+    return bad
 
 
 def get_domain(addr):
@@ -271,14 +363,10 @@ def get_domain(addr):
 
 
 def dest_domain(url):
-    """Best-effort host for a (possibly scheme-less) URL.
-
-    Proofpoint v3 decoding can yield a URL without an http(s):// scheme, where
-    urlparse() puts everything in .path and .netloc is empty. Fall back to the
-    leading path segment so destination checks still work.
-    """
+    """Best-effort host for a possibly scheme-less URL. Proofpoint v3 decoding
+    can drop the scheme, leaving the host in .path, so fall back to that."""
     parsed = urllib.parse.urlparse(url)
-    host = parsed.hostname  # already lowercased, strips userinfo and :port
+    host = parsed.hostname
     if not host and parsed.path:
         host = parsed.path.split('/', 1)[0].split('@')[-1].split(':', 1)[0]
     return (host or '').lower()
@@ -290,8 +378,7 @@ def decode_proofpoint(url):
         try:
             q = urllib.parse.urlparse(url).query
             u = urllib.parse.parse_qs(q).get('u', [''])[0]
-            # v2 encodes % as - and / as _. Reverse only the -XX sequences (real
-            # percent-encodings) so literal hyphens in names/paths aren't corrupted.
+            # v2 encodes % as - and / as _. Only undo -XX so literal hyphens survive.
             u = _PP_V2_HEX_RE.sub(r'%\1', u)
             u = u.replace('_', '/')
             return urllib.parse.unquote(u)
@@ -315,20 +402,36 @@ def proofpoint_in_path(msg):
     return 'pphosted.com' in received or 'proofpoint' in received
 
 
+def _is_hidden(attrs):
+    d = dict(attrs)
+    if 'hidden' in d:
+        return True
+    return bool(_HIDDEN_STYLE_RE.search(d.get('style') or ''))
+
+
 class HtmlAnalyzer(HTMLParser):
-    """Pulls anchor links (href + displayed text) and visible text from HTML."""
+    """Pulls anchor links (href + displayed text), visible text, and any text
+    that CSS hides from the reader, out of HTML."""
     def __init__(self):
         super().__init__()
-        self.links = []           # (href, displayed_text)
+        self.links = []
         self.text_parts = []
+        self.hidden_parts = []
         self._href = None
         self._buf = []
-        self._skip = 0            # depth counter for <script>/<style> blocks
+        self._skip = 0
+        self._stack = []    # (tag, hidden) for each open, non-void element
+        self._hidden = 0    # number of open ancestors that are hidden
 
     def handle_starttag(self, tag, attrs):
         if tag in SKIP_TAGS:
             self._skip += 1
             return
+        if tag not in VOID_TAGS and len(self._stack) < _MAX_NEST:
+            hidden = _is_hidden(attrs)
+            self._stack.append((tag, hidden))
+            if hidden:
+                self._hidden += 1
         if tag == 'a' and not self._skip:
             self._href = dict(attrs).get('href')
             self._buf = []
@@ -336,7 +439,10 @@ class HtmlAnalyzer(HTMLParser):
     def handle_data(self, data):
         if self._skip:
             return
-        self.text_parts.append(data)
+        if self._hidden:
+            self.hidden_parts.append(data)
+        else:
+            self.text_parts.append(data)
         if self._href is not None:
             self._buf.append(data)
 
@@ -349,14 +455,41 @@ class HtmlAnalyzer(HTMLParser):
             self.links.append((self._href, ''.join(self._buf).strip()))
             self._href = None
             self._buf = []
+        # Match the top of the stack only (O(1)); best-effort on malformed HTML,
+        # but a mismatched close tag can't trigger a costly full-stack scan.
+        if self._stack and self._stack[-1][0] == tag:
+            _, was_hidden = self._stack.pop()
+            if was_hidden:
+                self._hidden -= 1
 
     def visible_text(self):
         return ' '.join(self.text_parts)
+
+    def hidden_text(self):
+        return ' '.join(self.hidden_parts)
 
 
 def domain_in_text(text):
     m = TEXT_DOMAIN_RE.search(text.lower())
     return m.group(1) if m else ''
+
+
+def attachments(msg):
+    """Yield (filename, size, sha256, extensions) for each attached part.
+
+    `extensions` is the list of trailing extensions, so a double extension like
+    invoice.pdf.exe comes back as ['.pdf', '.exe'] for the caller to judge.
+    """
+    for part in msg.walk():
+        if part.get_content_maintype() == 'multipart':
+            continue
+        fn = part.get_filename()
+        if not fn and part.get_content_disposition() != 'attachment':
+            continue
+        payload = part.get_payload(decode=True) or b''
+        name = sanitize(fn or '(unnamed)')
+        exts = [e.lower() for e in re.findall(r'\.[A-Za-z0-9]{1,8}', name)][-2:]
+        yield name, len(payload), hashlib.sha256(payload).hexdigest(), exts
 
 
 def analyze(path):
@@ -403,7 +536,7 @@ def analyze(path):
                 findings.append((4, f"Proofpoint itself flagged this message ({h})"))
                 pp_flagged = True
 
-    # eTLD+1 compare, so a legit mail.corp.com vs corp.com split isn't flagged.
+    # Compare at eTLD+1 so a legit mail.corp.com vs corp.com split isn't flagged.
     if reply_dom and from_dom and not same_domain_family(reply_dom, from_dom):
         findings.append((2, f"Reply-To domain ({reply_dom}) != From domain ({from_dom})"))
     if rp_dom and from_dom and not same_domain_family(rp_dom, from_dom):
@@ -468,21 +601,35 @@ def analyze(path):
     raw_body = text_body + ' ' + html_body
 
     # ---------- LINK ANALYSIS ----------
+    # Decode every link so the analyst sees the real destinations. We do not
+    # score "link goes to a domain other than the sender" on its own: legit mail
+    # routinely links to trackers, CDNs and third parties, so it just floods the
+    # report with false positives. The text-vs-href mismatch below is the tell.
     decoded = []
     seen_decoded = set()
-    flagged_dest = set()
     for u in URL_RE.findall(raw_body):
         real = decode_proofpoint(u)
         if real not in seen_decoded:
             decoded.append(real)
             seen_decoded.add(real)
-        real_dom = dest_domain(real)
-        if real_dom and from_dom and not same_domain_family(from_dom, real_dom):
-            if real_dom not in flagged_dest:
-                findings.append((2, f"Link goes to {real_dom}, not sender domain {from_dom}"))
-                flagged_dest.add(real_dom)
 
-    # Displayed link text vs the real href.
+    # Look-alike destinations: mixed-script homographs and typosquats of the
+    # sender or a known brand. These are deliberate disguises, not noise.
+    from_reg = registrable_domain(from_dom) if from_dom else ''
+    seen_lookalike = set()
+    for real in decoded:
+        host = dest_domain(real)
+        if not host or host in seen_lookalike:
+            continue
+        for lab in idn_homograph(host):
+            findings.append((3, f"Mixed-script (homograph) domain in link: '{lab}'"))
+            seen_lookalike.add(host)
+        reg = registrable_domain(host)
+        target = typosquat_target(reg, from_reg)
+        if target and host not in seen_lookalike:
+            findings.append((3, f"Link domain '{reg}' imitates '{target}' (typosquat)"))
+            seen_lookalike.add(host)
+
     seen_mismatch = set()
     for href, text in parser.links:
         real = decode_proofpoint(href)
@@ -503,10 +650,33 @@ def analyze(path):
         if greet in visible:
             findings.append((1, f"Generic greeting (no real name): '{greet}'"))
             break
-    # Exclude words already scored via the subject to avoid double-counting.
+    # Skip subject words already scored above so we don't double-count.
     body_urgency = [w for w in URGENCY if w in visible and w not in subject_urgency]
     if body_urgency:
         findings.append((1, f"Urgency/pressure language in body (e.g. '{body_urgency[0]}')"))
+
+    # CSS-hidden text. Short hidden text is usually a legit preview/preheader, so
+    # only score it when it carries a lure phrase, which is a real evasion trick.
+    hidden = parser.hidden_text().lower()
+    hidden_hit = next((p for p in (CRED_HARVEST + URGENCY) if p in hidden), '')
+    if hidden_hit:
+        findings.append((2, f"Hidden (CSS) text contains a lure phrase: '{hidden_hit}'"))
+
+    if _ZW_RE.search(raw_body):
+        findings.append((1, "Zero-width or bidi control characters in body (obfuscation)"))
+
+    # ---------- ATTACHMENTS ----------
+    for name, size, digest, exts in attachments(msg):
+        info.append(f"[Attachment] {name}  ({size} bytes)  sha256={digest}")
+        last = exts[-1] if exts else ''
+        if len(exts) >= 2 and exts[-2] not in DANGEROUS_EXT and last in DANGEROUS_EXT:
+            findings.append((3, f"Misleading double extension on attachment: '{name}'"))
+        elif last in DANGEROUS_EXT:
+            findings.append((3, f"Dangerous attachment type ({last}): '{name}'"))
+        elif last in MACRO_EXT:
+            findings.append((2, f"Macro-enabled attachment ({last}): '{name}'"))
+        elif last in ARCHIVE_EXT:
+            findings.append((1, f"Archive attachment ({last}) may hide a payload: '{name}'"))
 
     return findings, info, decoded, pp, pp_flagged
 
@@ -589,17 +759,18 @@ def main():
         print(USAGE)
         sys.exit(1)
     path = paths[0]
+    safe_path = sanitize(path)
 
     if not quiet:
         print_banner()
-        print(f"Analyzing {path}...")
+        print(f"Analyzing {safe_path}...")
     try:
         findings, info, decoded, pp, pp_flagged = analyze(path)
     except FileNotFoundError:
-        print(f"[ERROR] File not found: {path}")
+        print(f"[ERROR] File not found: {safe_path}")
         sys.exit(1)
     except (OSError, ValueError) as exc:
-        print(f"[ERROR] Could not read {path}: {sanitize(str(exc))}")
+        print(f"[ERROR] Could not read {safe_path}: {sanitize(str(exc))}")
         sys.exit(1)
     except Exception as exc:
         print(f"[ERROR] Failed to parse email: {type(exc).__name__}: {sanitize(str(exc))}")

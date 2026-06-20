@@ -19,6 +19,9 @@ Most email security tools require cloud access or API keys, or only tell you wha
 - **Public Suffix List accuracy** - all domain comparisons use the registrable domain (eTLD+1) via a bundled PSL snapshot, so multi-label suffixes (`co.uk`, `com.au`) are handled correctly and cousin domains sharing a suffix (`servicea.gov.uk` vs `serviceb.gov.uk`) are recognised as different organisations
 - **Display name impersonation** - catches display names claiming to be IT, security, Microsoft, PayPal, etc. when the actual sending domain doesn't match
 - **Link text vs. href mismatch** - detects the classic trick of showing `paypal.com` in anchor text while the href goes elsewhere
+- **Look-alike domain detection** - flags link domains that mix scripts (a Cyrillic or Greek letter disguised as Latin, e.g. the homograph `pаypal.com`) or that are a typosquat of the sender or a known brand (`paypa1.com`, `micros0ft.com`)
+- **Attachment triage** - lists each attachment with its size and SHA-256, and flags dangerous executable/script types, macro-enabled Office files, archives, and misleading double extensions (`invoice.pdf.exe`). Attachments are never opened or detonated; the hash is there so you can look it up yourself
+- **Hidden-text and obfuscation checks** - catches CSS-hidden text that carries a lure phrase, and zero-width or bidi control characters used to break up words or reverse displayed text
 - **Credential-harvesting phrase detection** - matches common lure phrases ("verify your account", "update your credentials", etc.)
 - **Urgency and generic greeting detection** - soft signals for pressure language and impersonal salutations
 - **Numeric risk score** with a four-tier verdict (MINIMAL / LOW / MEDIUM / HIGH)
@@ -88,13 +91,12 @@ Analyzing suspicious.eml...
   [+4] Proofpoint itself flagged this message (X-Proofpoint-Spam-Details)
   [+3] Authority/brand display name from freemail (gmail.com)
   [+3] Link DISPLAYS 'microsoftonline.com' but actually goes to 'verify-account.ru'
-  [+2] Link goes to verify-account.ru, not sender domain gmail.com
   [+2] Credential-harvesting phrase: 'verify your account'
   [+1] SPF failed  (LOW conf - Proofpoint may have broken this)
   [+1] Urgency/lure keyword in SUBJECT: 'urgent'
   [+1] Generic greeting (no real name): 'dear user'
 
-=== RISK SCORE: 17  [██████████]  HIGH - strong phishing indicators ===
+=== RISK SCORE: 15  [██████████]  HIGH - strong phishing indicators ===
 
 Proofpoint detected: raw SPF/DKIM/DMARC fails scored LOW (they
 break on clean mail here). PPS flagged this - weight heavily.
@@ -123,9 +125,9 @@ The analyzer assigns each signal a weight and sums them into a risk score.
 | Weight | Signal |
 |--------|--------|
 | +4 | Proofpoint's own verdict flags the message as phish/malware/spam |
-| +3 | Display name impersonation, or link text/href domain mismatch |
-| +2 | Reply-To or Return-Path domain mismatch; external link destination; credential-harvesting phrase; DKIM/DMARC fail (no Proofpoint) |
-| +1 | SPF fail; no auth headers; Message-ID domain mismatch; urgency keyword; generic greeting; body pressure language |
+| +3 | Display name impersonation; link text/href domain mismatch; homograph or typosquat link domain; dangerous attachment type; misleading double extension |
+| +2 | Reply-To or Return-Path domain mismatch; credential-harvesting phrase; DKIM/DMARC fail (no Proofpoint); macro-enabled attachment; hidden text carrying a lure phrase |
+| +1 | SPF fail; no auth headers; Message-ID domain mismatch; urgency keyword; generic greeting; body pressure language; archive attachment; zero-width/bidi characters |
 
 Proofpoint-aware mode automatically reduces SPF, DKIM, and DMARC weights to +1 when Proofpoint is detected in the mail path, since relay rewriting routinely breaks those checks on clean mail.
 
@@ -133,7 +135,7 @@ Proofpoint-aware mode automatically reduces SPF, DKIM, and DMARC weights to +1 w
 
 ## Tests
 
-A `unittest` suite (standard library, no extra packages) covers the core logic: Proofpoint v2/v3 link decoding, eTLD+1 registrable-domain comparison, terminal-escape sanitization, and an end-to-end run over crafted phishing and benign `.eml` fixtures.
+A `unittest` suite (standard library, no extra packages) covers the core logic: Proofpoint v2/v3 link decoding, eTLD+1 registrable-domain comparison, terminal-escape sanitization, typosquat and homograph detection, attachment triage, hidden-text and zero-width detection, and end-to-end runs over crafted phishing and benign `.eml` fixtures (including false-positive guards for normal third-party links and marketing preheaders).
 
 ```
 python -m unittest discover -v
@@ -146,8 +148,9 @@ python -m unittest discover -v
 - **Proofpoint v2 hex heuristic** - the v2 decoder reverses Proofpoint's `%`->`-` substitution by turning any `-XX` (where `XX` are two hex digits, `0-9`/`a-f`) back into `%XX`. This preserves most literal hyphens, but a hyphen followed by two hex characters in a real link will be mis-decoded, e.g. `support-365.com` or `route-1a.example` get garbled because `-36`/`-1a` look like percent-encodings. Treat a v2-decoded destination containing a hyphen-plus-digits segment with suspicion and verify it manually. URLs without such sequences decode correctly.
 - **Content signals are noisy** - urgency words, generic greetings, and credential phrases fire on legitimate bulk mail (password reset emails, bank statements, IT notifications). Treat them as soft context, not verdicts.
 - **Links are decoded, not fetched** - no DNS lookups, no page rendering, no sandbox. A convincing domain name (`login.microsoftonline.com.verify-account.ru`) requires human judgment to evaluate.
-- **Basic HTML parser** - heavily obfuscated HTML (CSS-hidden text, zero-font-size tricks, Unicode lookalikes) may not be detected.
-- **Attachments are not analyzed** - only the email body and headers are inspected. Malicious payloads in PDF or Office attachments are out of scope.
+- **HTML parser is best-effort** - it now catches CSS-hidden text and zero-width/bidi characters, but malformed markup or more exotic tricks (off-screen positioning, colour-on-colour text, image-only bodies) can still slip past.
+- **Typosquat/homograph detection is conservative** - it catches mixed-script labels and common character swaps against the sender and a built-in brand list, so unusual look-alikes or brands not on the list won't be flagged. The decoded link list is still shown for manual review.
+- **Attachments are flagged, not inspected** - each attachment is listed with its size and SHA-256, and risky types/extensions are scored, but files are never opened or detonated. Malicious payloads *inside* a PDF or Office document are out of scope; use the SHA-256 for an external lookup.
 - **PSL snapshot ages** - domain comparison uses a point-in-time copy of the Public Suffix List (`public_suffix_list.dat`). Newly delegated suffixes added after the snapshot won't be recognised until you refresh it (see *Maintenance* below).
 - **Single-file input only** - no batch mode; run once per email.
 
@@ -157,8 +160,7 @@ python -m unittest discover -v
 
 - Batch mode: analyze a directory of `.eml` files and produce a summary table
 - JSON output flag for piping results into a SIEM or ticketing system
-- Optional VirusTotal / URLhaus reputation lookup for decoded link destinations
-- Attachment hashing (MD5/SHA256) for known-malware lookups
+- Optional online enrichment (URLhaus, Safe Browsing, VirusTotal by hash/URL-ID) behind an explicit `--online` flag, off by default
 - `--no-color` and `--help`/`-h` flags
 - Grouped, prioritized signals (sorted highest-weight first, under Auth / Links / Content subheadings)
 

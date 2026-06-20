@@ -124,6 +124,194 @@ class EndToEndTests(unittest.TestCase):
         score = sum(w for w, _ in findings)
         self.assertEqual(score, 0)
 
+    def test_external_link_alone_does_not_score(self):
+        # A link to a third-party domain (tracker/CDN/unsubscribe) is normal in
+        # legit mail and must not score on its own. Only a text-vs-href mismatch
+        # should. This guards against re-adding the old false-positive signal.
+        eml = (
+            "From: Alice <alice@example.com>\n"
+            "Subject: Newsletter\n"
+            "Authentication-Results: mx.test; spf=pass; dkim=pass; dmarc=pass\n"
+            "Message-ID: <1@example.com>\n"
+            "Content-Type: text/html\n"
+            "\n"
+            "<html><body>Hello!"
+            '<a href="https://track.mailchimp.com/x">read more</a>'
+            "</body></html>\n"
+        )
+        path = _write_eml(eml)
+        try:
+            findings, info, decoded, pp, pp_flagged = pa.analyze(path)
+        finally:
+            os.remove(path)
+        score = sum(w for w, _ in findings)
+        self.assertEqual(score, 0)
+
+
+def _descs(findings):
+    return " | ".join(d.lower() for _, d in findings)
+
+
+class TyposquatTests(unittest.TestCase):
+    def test_digit_swap_imitates_brand(self):
+        self.assertEqual(pa.typosquat_target("paypa1.com"), "paypal.com")
+        self.assertEqual(pa.typosquat_target("micros0ft.com"), "microsoft.com")
+
+    def test_real_brand_is_not_flagged(self):
+        self.assertEqual(pa.typosquat_target("paypal.com"), "")
+
+    def test_one_char_off_sender_is_flagged(self):
+        self.assertEqual(
+            pa.typosquat_target("examp1e.com", "example.com"), "example.com")
+
+    def test_unrelated_lookalike_does_not_false_positive(self):
+        # goggle.com / doodle.com are real sites a hair away from a brand.
+        self.assertEqual(pa.typosquat_target("goggle.com"), "")
+        self.assertEqual(pa.typosquat_target("doodle.com"), "")
+
+
+class HomographTests(unittest.TestCase):
+    def test_mixed_script_label_is_flagged(self):
+        # 'paypal' with a Cyrillic 'a'.
+        host = "pаypal.com"
+        self.assertEqual(pa.idn_homograph(host), ["pаypal"])
+
+    def test_punycode_homograph_is_flagged(self):
+        host = pa._normalize("pаypal.com")
+        self.assertTrue(host.startswith("xn--"))
+        self.assertTrue(pa.idn_homograph(host))
+
+    def test_legit_diacritics_are_not_flagged(self):
+        self.assertEqual(pa.idn_homograph("müller.de"), [])
+
+
+class LevenshteinTests(unittest.TestCase):
+    def test_known_distances(self):
+        self.assertEqual(pa._levenshtein("kitten", "sitting"), 3)
+        self.assertEqual(pa._levenshtein("abc", "abc"), 0)
+        self.assertEqual(pa._levenshtein("abc", "abd"), 1)
+
+
+class AttachmentTests(unittest.TestCase):
+    def test_double_extension_is_flagged(self):
+        eml = (
+            "From: Alice <alice@example.com>\n"
+            "Subject: invoice\n"
+            "Authentication-Results: mx.test; spf=pass; dkim=pass; dmarc=pass\n"
+            "Message-ID: <1@example.com>\n"
+            'Content-Type: multipart/mixed; boundary="b"\n'
+            "\n"
+            "--b\n"
+            "Content-Type: text/plain\n"
+            "\n"
+            "See attached.\n"
+            "--b\n"
+            "Content-Type: application/octet-stream\n"
+            'Content-Disposition: attachment; filename="invoice.pdf.exe"\n'
+            "Content-Transfer-Encoding: base64\n"
+            "\n"
+            "TVpwYXlsb2Fk\n"
+            "--b--\n"
+        )
+        path = _write_eml(eml)
+        try:
+            findings, info, decoded, pp, pp_flagged = pa.analyze(path)
+        finally:
+            os.remove(path)
+        self.assertIn("double extension", _descs(findings))
+        # the sha256 of the payload is surfaced for hash lookups
+        self.assertTrue(any("sha256=" in line for line in info))
+
+    def test_benign_pdf_attachment_does_not_score(self):
+        eml = (
+            "From: Alice <alice@example.com>\n"
+            "Subject: report\n"
+            "Authentication-Results: mx.test; spf=pass; dkim=pass; dmarc=pass\n"
+            "Message-ID: <1@example.com>\n"
+            'Content-Type: multipart/mixed; boundary="b"\n'
+            "\n"
+            "--b\n"
+            "Content-Type: text/plain\n"
+            "\n"
+            "Here is the report.\n"
+            "--b\n"
+            "Content-Type: application/pdf\n"
+            'Content-Disposition: attachment; filename="report.pdf"\n'
+            "Content-Transfer-Encoding: base64\n"
+            "\n"
+            "JVBERi0=\n"
+            "--b--\n"
+        )
+        path = _write_eml(eml)
+        try:
+            findings, info, decoded, pp, pp_flagged = pa.analyze(path)
+        finally:
+            os.remove(path)
+        self.assertEqual(sum(w for w, _ in findings), 0)
+
+
+class HiddenContentTests(unittest.TestCase):
+    def test_hidden_lure_text_and_zero_width(self):
+        eml = (
+            "From: Alice <alice@example.com>\n"
+            "Subject: hello\n"
+            "Authentication-Results: mx.test; spf=pass; dkim=pass; dmarc=pass\n"
+            "Message-ID: <1@example.com>\n"
+            'Content-Type: text/html; charset="utf-8"\n'
+            "\n"
+            "<html><body>Hi​ there"
+            '<div style="display:none">verify your account</div>'
+            "</body></html>\n"
+        )
+        path = _write_eml(eml)
+        try:
+            findings, info, decoded, pp, pp_flagged = pa.analyze(path)
+        finally:
+            os.remove(path)
+        descs = _descs(findings)
+        self.assertIn("hidden (css) text", descs)
+        self.assertIn("zero-width", descs)
+
+    def test_short_hidden_preheader_does_not_score(self):
+        # Legit marketing preheaders are hidden but carry no lure phrase.
+        eml = (
+            "From: Alice <alice@example.com>\n"
+            "Subject: newsletter\n"
+            "Authentication-Results: mx.test; spf=pass; dkim=pass; dmarc=pass\n"
+            "Message-ID: <1@example.com>\n"
+            "Content-Type: text/html\n"
+            "\n"
+            "<html><body>"
+            '<div style="display:none">This week at our company</div>'
+            "Welcome to our newsletter.</body></html>\n"
+        )
+        path = _write_eml(eml)
+        try:
+            findings, info, decoded, pp, pp_flagged = pa.analyze(path)
+        finally:
+            os.remove(path)
+        self.assertEqual(sum(w for w, _ in findings), 0)
+
+
+class TyposquatLinkTests(unittest.TestCase):
+    def test_typosquat_link_in_body_is_flagged(self):
+        eml = (
+            "From: Alice <alice@example.com>\n"
+            "Subject: notice\n"
+            "Authentication-Results: mx.test; spf=pass; dkim=pass; dmarc=pass\n"
+            "Message-ID: <1@example.com>\n"
+            "Content-Type: text/html\n"
+            "\n"
+            '<html><body><a href="https://paypa1.com/login">click</a>'
+            "</body></html>\n"
+        )
+        path = _write_eml(eml)
+        try:
+            findings, info, decoded, pp, pp_flagged = pa.analyze(path)
+        finally:
+            os.remove(path)
+        self.assertIn("imitates 'paypal.com'", _descs(findings))
+
 
 if __name__ == "__main__":
     unittest.main()
