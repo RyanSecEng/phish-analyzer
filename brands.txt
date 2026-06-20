@@ -1,0 +1,95 @@
+# Extra brands phishing imitates, added to the built-in list in phish-analyzer.py.
+# Used for typosquat, homograph and brand-in-subdomain checks. Add your own org's
+# domains here - look-alike detection is only as good as this list. One domain
+# per line; '#' is a comment.
+
+# --- Microsoft / Office ecosystem ---
+microsoftonline.com
+live.com
+sharepoint.com
+onedrive.com
+azure.com
+windows.com
+skype.com
+
+# --- Google / Apple ---
+gmail.com
+googledrive.com
+icloud.com
+itunes.com
+
+# --- Payments / finance ---
+stripe.com
+squareup.com
+venmo.com
+wise.com
+intuit.com
+quickbooks.com
+turbotax.com
+citi.com
+citibank.com
+capitalone.com
+usbank.com
+pnc.com
+tdbank.com
+hsbc.com
+barclays.com
+santander.com
+discover.com
+visa.com
+mastercard.com
+
+# --- Crypto ---
+binance.com
+kraken.com
+metamask.io
+blockchain.com
+crypto.com
+ledger.com
+
+# --- Shipping / retail ---
+ups.com
+fedex.com
+usps.com
+dhl.com
+walmart.com
+target.com
+costco.com
+bestbuy.com
+ebay.com
+etsy.com
+
+# --- Cloud / SaaS / collaboration ---
+salesforce.com
+slack.com
+zoom.us
+atlassian.com
+github.com
+gitlab.com
+notion.so
+asana.com
+servicenow.com
+workday.com
+okta.com
+duosecurity.com
+1password.com
+lastpass.com
+
+# --- Social / comms / streaming ---
+whatsapp.com
+twitter.com
+x.com
+tiktok.com
+snapchat.com
+spotify.com
+disneyplus.com
+hulu.com
+youtube.com
+
+# --- Telecom / ISP ---
+att.com
+verizon.com
+t-mobile.com
+comcast.com
+xfinity.com
+spectrum.com

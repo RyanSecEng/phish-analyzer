@@ -15,9 +15,11 @@ import hashlib
 import os
 import re
 import sys
+import time
 import unicodedata
 import urllib.parse
 from email import policy
+from email.utils import parseaddr
 from html.parser import HTMLParser
 
 # Force UTF-8 so box-drawing glyphs survive on Windows consoles.
@@ -59,19 +61,20 @@ def c(text, *codes):
 
 
 BANNER = r"""
-                 ____  _   _ ___ ____  _   _
+                 ____  _   _ ___ ____  _   _          ><(((">
                 |  _ \| | | |_ _/ ___|| | | |
-                | |_) | |_| || |\___ \| |_| |
+                | |_) | |_| || |\___ \| |_| |       ><>
                 |  __/|  _  || | ___) |  _  |
-                |_|   |_| |_|___|____/|_| |_|
+                |_|   |_| |_|___|____/|_| |_|              <">><
 
     _     _   _     _     _     __   __ _____  _____  ____
    / \   | \ | |   / \   | |    \ \ / /|__  / | ____||  _ \
   / _ \  |  \| |  / _ \  | |     \ V /   / /  |  _|  | |_) |
  / ___ \ | |\  | / ___ \ | |___   | |   / /_  | |___ |  _ <
 /_/   \_\|_| \_|/_/   \_\|_____|  |_|  /____| |_____||_| \_\
-
-          local .eml phishing triage - runs 100% offline
+ ._______________________________________________________.
+ |  local .eml phishing triage  .  no cloud, 100% offline |
+ '-------------------------------------------------------'
 """
 
 
@@ -136,12 +139,13 @@ CRED_HARVEST = ['confirm your password', 'verify your account', 'update your pay
 PP_BAD_TOKENS = ['rule=spam', 'rule=phish', 'rule=malware', 'rule=impostor',
                  'classifier=phish', 'classifier=malware', 'definitive=phish']
 
-# Brands phishing commonly imitates, used for typosquat/homoglyph comparison.
-BRANDS = ['microsoft.com', 'office365.com', 'outlook.com', 'paypal.com',
-          'amazon.com', 'apple.com', 'google.com', 'docusign.com',
-          'dropbox.com', 'linkedin.com', 'netflix.com', 'facebook.com',
-          'instagram.com', 'wellsfargo.com', 'chase.com', 'bankofamerica.com',
-          'americanexpress.com', 'coinbase.com', 'adobe.com']
+# Brands phishing tends to imitate. brands.txt adds to this.
+_BUILTIN_BRANDS = ['microsoft.com', 'office365.com', 'outlook.com', 'paypal.com',
+                   'amazon.com', 'apple.com', 'google.com', 'docusign.com',
+                   'dropbox.com', 'linkedin.com', 'netflix.com', 'facebook.com',
+                   'instagram.com', 'wellsfargo.com', 'chase.com',
+                   'bankofamerica.com', 'americanexpress.com', 'coinbase.com',
+                   'adobe.com']
 
 # Attachment extensions that run code on open, or that hide one.
 DANGEROUS_EXT = {'.exe', '.scr', '.com', '.pif', '.bat', '.cmd', '.js', '.jse',
@@ -149,20 +153,19 @@ DANGEROUS_EXT = {'.exe', '.scr', '.com', '.pif', '.bat', '.cmd', '.js', '.jse',
                  '.img', '.msi', '.ps1', '.reg', '.cpl', '.msc', '.gadget'}
 MACRO_EXT = {'.docm', '.xlsm', '.pptm', '.dotm', '.xlam', '.xltm', '.potm'}
 ARCHIVE_EXT = {'.zip', '.rar', '.7z', '.ace', '.cab', '.gz', '.tar', '.iso'}
+# HTML/SVG attachments open a local phishing page, or run script (svg).
+HTML_ATTACH_EXT = {'.html', '.htm', '.shtml', '.xhtml', '.mht', '.mhtml', '.svg'}
 
 SKIP_TAGS = {'script', 'style'}
 
-# Void/self-closing tags never get a close tag, so we don't push them on the
-# tag stack the HTML parser keeps for tracking hidden ancestors.
+# Self-closing tags have no end tag, so we keep them off the nesting stack.
 VOID_TAGS = {'area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input',
              'link', 'meta', 'param', 'source', 'track', 'wbr'}
 
-# Bound the tag stack so crafted, absurdly nested HTML can't blow up memory or
-# CPU. Real email HTML never nests anywhere near this deep.
+# Nothing legit nests this deep; the cap bounds work on malformed HTML.
 _MAX_NEST = 200
 
-# Exclude control bytes (including ESC) so escape sequences can't be smuggled
-# into a "URL" and printed later.
+# No control bytes, so an escape sequence can't hide in a URL and fire on print.
 URL_RE = re.compile(r'https?://[^\s"\'<>)\x00-\x1f\x7f]+', re.IGNORECASE)
 DOMAIN_RE = re.compile(r'@([A-Za-z0-9.-]+\.[A-Za-z]{2,})')
 TEXT_DOMAIN_RE = re.compile(
@@ -174,14 +177,13 @@ _PP_V2_HEX_RE = re.compile(r'-([0-9A-Fa-f]{2})')
 
 _ANSI_RE = re.compile(r'\x1b(?:\[[0-9;]*[a-zA-Z]|\].*?(?:\x07|\x1b\\))')
 
-# CSS that hides an element from the reader (used for poison/keyword-stuffed text).
+# CSS that hides an element from the reader.
 _HIDDEN_STYLE_RE = re.compile(
     r'display\s*:\s*none|visibility\s*:\s*hidden|opacity\s*:\s*0(?![.\d])'
     r'|font-size\s*:\s*0(?![.\d])|font-size\s*:\s*1px|max-height\s*:\s*0',
     re.IGNORECASE)
 
-# Zero-width, soft-hyphen and bidi control characters that don't belong in body
-# text and are used to break up words or reverse displayed text.
+# Zero-width, soft-hyphen and bidi characters used to split or reverse words.
 _ZW_RE = re.compile(
     '[­​‌‍‎‏‪-‮⁠﻿]')
 
@@ -237,6 +239,48 @@ def _init_psl(path):
 _PSL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                          'public_suffix_list.dat')
 _PSL_RULES, _PSL_EXCEPTIONS, PSL_WARNING = _init_psl(_PSL_PATH)
+
+
+def _load_list(filename):
+    """Load a one-per-line list file (domains, TLDs, etc.) sitting next to this
+    script. Lines starting with # are comments; blank lines and trailing inline
+    # comments are ignored, and a leading dot is stripped so '.zip' and 'zip'
+    both work. A missing file just yields an empty set, so the tool still runs."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), filename)
+    items = set()
+    try:
+        with open(path, encoding='utf-8') as fh:
+            for line in fh:
+                line = line.split('#', 1)[0].strip().lower().lstrip('.')
+                if line:
+                    items.add(line)
+    except OSError:
+        pass
+    return items
+
+
+# Optional reference lists, one entry per line, kept next to this script.
+ALLOWLIST = _load_list('allowlist.txt')           # senders you trust
+ESP_DOMAINS = _load_list('esp_domains.txt')       # bulk mail / tracker domains
+SHORTENERS = _load_list('shorteners.txt')         # link shorteners
+SUSPICIOUS_TLDS = _load_list('suspicious_tlds.txt')  # high-abuse TLDs
+# Your curated list plus the feed file written by update_feeds.py.
+PHISH_DOMAINS = _load_list('phish_domains.txt') | _load_list('phish_domains.feed.txt')
+BRANDS = sorted(set(_BUILTIN_BRANDS) | _load_list('brands.txt'))
+
+_FEED_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          'phish_domains.feed.txt')
+
+
+def _feed_note():
+    """Freshness line for the known-bad feed, shown in the header summary."""
+    n = len(PHISH_DOMAINS)
+    if not os.path.exists(_FEED_PATH):
+        return (f"Known-bad list: {n} hosts (no feed file; run update_feeds.py "
+                "for the full offline blocklist)")
+    age = (time.time() - os.path.getmtime(_FEED_PATH)) / 86400
+    stale = "  (stale, run update_feeds.py)" if age > 14 else ""
+    return f"Known-bad list: {n} hosts, feed {age:.0f} day(s) old{stale}"
 
 
 def registrable_domain(host):
@@ -356,15 +400,21 @@ def idn_homograph(host):
 
 
 def get_domain(addr):
+    """Registrable host of the REAL address, i.e. the one in angle brackets,
+    parsed with parseaddr so an '@domain' planted in the display name (a common
+    spoof) can't be mistaken for the sending domain."""
     if not addr:
         return ''
+    _name, email_addr = parseaddr(addr)
+    if email_addr and '@' in email_addr:
+        return email_addr.rsplit('@', 1)[-1].strip().strip('>').lower()
     m = DOMAIN_RE.search(addr)
     return m.group(1).lower() if m else ''
 
 
 def dest_domain(url):
-    """Best-effort host for a possibly scheme-less URL. Proofpoint v3 decoding
-    can drop the scheme, leaving the host in .path, so fall back to that."""
+    """Host for a possibly scheme-less URL. Proofpoint v3 decoding can drop the
+    scheme, leaving the host in .path, so fall back to that."""
     parsed = urllib.parse.urlparse(url)
     host = parsed.hostname
     if not host and parsed.path:
@@ -394,6 +444,110 @@ def decode_proofpoint(url):
     return url
 
 
+# Hosts that rewrite links for security. We unwrap them but don't treat their
+# redirects as the "link inside a link" trick.
+_SECURITY_WRAPPERS = ('urldefense.proofpoint.com', 'urldefense.com',
+                      'urldefense.us', 'safelinks.protection.outlook.com',
+                      'mimecast.com', 'linkprotect.cudasvc.com', 'ampproject.org')
+
+# Query params that usually carry a redirect target. 'q' is excluded since it's
+# normally a search term.
+_REDIRECT_PARAMS = ('url', 'redirect', 'redirect_uri', 'redirecturl', 'next',
+                    'return', 'returnurl', 'dest', 'destination', 'u', 'target',
+                    'link', 'goto', 'continue')
+
+
+def _get_param(url, *names):
+    """First query-string value whose key matches any of names (case-insensitive)."""
+    try:
+        params = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+    except Exception:
+        return ''
+    lower = {k.lower(): v for k, v in params.items()}
+    for n in names:
+        if lower.get(n):
+            return lower[n][0]
+    return ''
+
+
+def decode_redirect(url):
+    """Unwrap known link-protection and redirect wrappers (Proofpoint, Microsoft
+    Safelinks, Mimecast, Barracuda, Google AMP) to the real destination. Returns
+    the input unchanged if nothing matches."""
+    real = decode_proofpoint(url)
+    if real != url:
+        return real
+    host = dest_domain(url)
+    low = url.lower()
+    if 'safelinks.protection.outlook.com' in host:
+        t = _get_param(url, 'url')
+        if t:
+            return urllib.parse.unquote(t)
+    if 'linkprotect.cudasvc.com' in host:
+        t = _get_param(url, 'a')
+        if t:
+            return urllib.parse.unquote(t)
+    if 'mimecast.com' in host and '/s/' in url:
+        dom = _get_param(url, 'domain')
+        if dom:
+            return 'https://' + dom.strip().lstrip('/')
+    if 'ampproject.org' in host or '/amp/s/' in low:
+        m = re.search(r'/(?:amp/s|c/s)/(.+)', url)
+        if m:
+            tail = m.group(1)
+            return tail if tail.startswith('http') else 'https://' + tail
+    return url
+
+
+def open_redirect_target(url, trusted_hosts=frozenset()):
+    """If url is a generic open-redirect (not a known security wrapper) whose
+    query carries a full URL on a different registrable domain, return that
+    domain. This catches the 'link hidden inside a link' cloaking trick."""
+    host = dest_domain(url)
+    if not host or any(w in host for w in _SECURITY_WRAPPERS):
+        return ''
+    if registrable_domain(host) in trusted_hosts:
+        return ''
+    val = _get_param(url, *_REDIRECT_PARAMS)
+    if not val:
+        return ''
+    val = urllib.parse.unquote(val)
+    if '://' not in val and not val.startswith('//'):
+        return ''
+    target = dest_domain(val)
+    if target and not same_domain_family(target, host):
+        return registrable_domain(target) or target
+    return ''
+
+
+def _is_ip_host(host):
+    """True if host is a raw IP literal: dotted IPv4, IPv6, or a hex/decimal
+    integer that some clients still resolve as an address."""
+    if not host:
+        return False
+    if ':' in host:
+        return True
+    if re.fullmatch(r'\d{1,3}(?:\.\d{1,3}){3}', host):
+        return True
+    if re.fullmatch(r'0x[0-9a-f]+', host) or re.fullmatch(r'\d{6,}', host):
+        return True
+    return False
+
+
+def decode_idna_host(host):
+    """Turn xn-- punycode labels back into readable Unicode so a disguised host
+    can be shown as it actually reads."""
+    out = []
+    for lab in host.split('.'):
+        if lab.startswith('xn--'):
+            try:
+                lab = lab.encode('ascii').decode('idna')
+            except Exception:
+                pass
+        out.append(lab)
+    return '.'.join(out)
+
+
 def proofpoint_in_path(msg):
     for h in msg.keys():
         if h.lower().startswith('x-proofpoint'):
@@ -415,6 +569,8 @@ class HtmlAnalyzer(HTMLParser):
     def __init__(self):
         super().__init__()
         self.links = []
+        self.form_actions = []
+        self.meta_refresh = []
         self.text_parts = []
         self.hidden_parts = []
         self._href = None
@@ -432,9 +588,18 @@ class HtmlAnalyzer(HTMLParser):
             self._stack.append((tag, hidden))
             if hidden:
                 self._hidden += 1
+        d = dict(attrs)
         if tag == 'a' and not self._skip:
-            self._href = dict(attrs).get('href')
+            self._href = d.get('href')
             self._buf = []
+        elif tag == 'form':
+            if d.get('action'):
+                self.form_actions.append(d['action'])
+        elif tag == 'meta' and (d.get('http-equiv') or '').lower() == 'refresh':
+            m = re.search(r'url\s*=\s*([^\s;]+)', d.get('content') or '',
+                          re.IGNORECASE)
+            if m:
+                self.meta_refresh.append(m.group(1).strip('\'"'))
 
     def handle_data(self, data):
         if self._skip:
@@ -455,8 +620,7 @@ class HtmlAnalyzer(HTMLParser):
             self.links.append((self._href, ''.join(self._buf).strip()))
             self._href = None
             self._buf = []
-        # Match the top of the stack only (O(1)); best-effort on malformed HTML,
-        # but a mismatched close tag can't trigger a costly full-stack scan.
+        # Only pop when the top of the stack matches; a stray close tag is ignored.
         if self._stack and self._stack[-1][0] == tag:
             _, was_hidden = self._stack.pop()
             if was_hidden:
@@ -499,10 +663,12 @@ def analyze(path):
     with open(path, 'rb') as fh:
         msg = email.message_from_binary_file(fh, policy=policy.default)
 
-    findings = []   # (weight, description)
+    hard = []   # (weight, desc) structural/auth/link/attachment signals
+    soft = []   # (weight, desc) language signals, scored only with corroboration
     info = []
     if PSL_WARNING:
         info.append(PSL_WARNING)
+    info.append(_feed_note())
     pp = proofpoint_in_path(msg)
 
     frm = str(msg.get('From', ''))
@@ -514,6 +680,7 @@ def analyze(path):
     from_dom = get_domain(frm)
     reply_dom = get_domain(reply_to)
     rp_dom = get_domain(return_path)
+    from_reg = registrable_domain(from_dom) if from_dom else ''
 
     info.append(f"Proofpoint in path: {'YES' if pp else 'no'}")
     info.append(f"From:        {frm}")
@@ -526,6 +693,14 @@ def analyze(path):
     all_auth = ' '.join(str(a).lower() for a in auth_headers)
     for i, a in enumerate(auth_headers):
         info.append(f"[Auth-Results #{i+1}] {str(a)[:160]}")
+    # Only the top Authentication-Results header can grant trust: your own gateway
+    # stamps it last, so a remote sender can't forge a pass below it. Failure
+    # checks still scan every header.
+    top_auth = str(auth_headers[0]).lower() if auth_headers else ''
+    dmarc_pass = 'dmarc=pass' in top_auth
+    if 'dmarc=pass' in all_auth and not dmarc_pass:
+        info.append("[note] A lower Authentication-Results header claims dmarc=pass "
+                    "but the top (trusted) header does not; not treated as trusted.")
 
     pp_flagged = False
     for h in msg.keys():
@@ -533,51 +708,79 @@ def analyze(path):
             val = str(msg.get(h))
             info.append(f"[PPS] {h}: {val[:160]}")
             if any(tok in val.lower() for tok in PP_BAD_TOKENS):
-                findings.append((4, f"Proofpoint itself flagged this message ({h})"))
+                hard.append((4, f"Proofpoint itself flagged this message ({h})"))
                 pp_flagged = True
 
-    # Compare at eTLD+1 so a legit mail.corp.com vs corp.com split isn't flagged.
+    # Reply-To and Return-Path splits are normal for ESPs and bounce domains. A
+    # Reply-To to freemail or a known-bad domain is the real BEC tell and stays
+    # hard; the rest is soft, and skipped when DMARC passed or the domain is a
+    # known ESP.
     if reply_dom and from_dom and not same_domain_family(reply_dom, from_dom):
-        findings.append((2, f"Reply-To domain ({reply_dom}) != From domain ({from_dom})"))
+        reply_reg = registrable_domain(reply_dom)
+        if reply_dom in FREEMAIL or reply_reg in PHISH_DOMAINS:
+            hard.append((2, f"Reply-To points to an unrelated address ({reply_dom}) "
+                            f"while From is {from_dom}"))
+        elif not dmarc_pass and reply_reg not in ESP_DOMAINS:
+            soft.append((1, f"Reply-To domain ({reply_dom}) differs from From ({from_dom})"))
     if rp_dom and from_dom and not same_domain_family(rp_dom, from_dom):
-        findings.append((2, f"Return-Path domain ({rp_dom}) != From domain ({from_dom})"))
+        if not dmarc_pass and registrable_domain(rp_dom) not in ESP_DOMAINS:
+            soft.append((1, f"Return-Path domain ({rp_dom}) differs from From ({from_dom})"))
 
-    if '<' in frm:
-        display = frm.split('<')[0].strip().lower()
-        # Whole-word match so short terms ('it', 'hr') don't fire inside words.
-        matched = [t for t in (term.strip() for term in IMPERSONATION_TERMS)
-                   if re.search(r'\b' + re.escape(t) + r'\b', display)]
-        if matched:
-            if from_dom in FREEMAIL:
-                findings.append((3, f"Authority/brand display name from freemail ({from_dom})"))
-            else:
-                for term in matched:
-                    if term not in from_dom:
-                        findings.append((3, f"Display name implies '{term}' but domain is {from_dom}"))
-                        break
+    if '<' in frm and from_dom:
+        display = frm.split('<', 1)[0].strip().strip('"\'').lower()
+        # Display name embedding someone else's address/domain, e.g.
+        # "security@microsoft.com" <attacker@evil.ru>.
+        m = re.search(r'[\w.+-]+@([a-z0-9.-]+\.[a-z]{2,})', display)
+        claimed_dom = m.group(1) if m else domain_in_text(display)
+        if claimed_dom and not same_domain_family(claimed_dom, from_dom):
+            hard.append((3, f"Display name claims '{claimed_dom}' but the real "
+                            f"sender domain is {from_dom}"))
+        else:
+            # Whole-word match so short terms ('it', 'hr') don't fire inside words.
+            matched = [t for t in (term.strip() for term in IMPERSONATION_TERMS)
+                       if re.search(r'\b' + re.escape(t) + r'\b', display)]
+            if matched:
+                if from_dom in FREEMAIL:
+                    hard.append((3, f"Authority/brand display name from freemail ({from_dom})"))
+                else:
+                    for term in matched:
+                        if term not in from_dom:
+                            hard.append((3, f"Display name implies '{term}' but domain is {from_dom}"))
+                            break
+
+    # Sender domain itself imitating a brand (paypa1.com) or mixing scripts.
+    if from_reg:
+        ft = typosquat_target(from_reg)
+        if ft:
+            hard.append((3, f"Sender domain '{from_reg}' imitates '{ft}' (typosquat)"))
+    for lab in idn_homograph(from_dom):
+        hard.append((3, f"Mixed-script (homograph) sender domain: '{lab}'"))
 
     if auth_headers:
         spf_w, dkim_w, dmarc_w = (1, 1, 1) if pp else (2, 2, 3)
         note = "  (LOW conf - Proofpoint may have broken this)" if pp else ""
         if 'spf=fail' in all_auth or 'spf=softfail' in all_auth:
-            findings.append((spf_w, "SPF failed" + note))
+            hard.append((spf_w, "SPF failed" + note))
         if 'dkim=fail' in all_auth:
-            findings.append((dkim_w, "DKIM failed" + (
+            hard.append((dkim_w, "DKIM failed" + (
                 "  (LOW conf - URL rewriting breaks DKIM body hash)" if pp else "")))
         if 'dmarc=fail' in all_auth:
-            findings.append((dmarc_w, "DMARC failed" + note))
+            hard.append((dmarc_w, "DMARC failed" + note))
     else:
-        findings.append((1, "No Authentication-Results header found"))
+        # Usually means the .eml was exported before auth ran, so don't score it.
+        info.append("[note] No Authentication-Results header (often stripped when "
+                    "saving an .eml); not scored.")
 
+    # Common for legit mail services, so keep it as a soft hint.
     mid_dom = msg_id.split('@')[-1].strip('>').lower() if '@' in msg_id else ''
     if mid_dom and from_dom and not same_domain_family(mid_dom, from_dom):
-        findings.append((1, f"Message-ID domain ({mid_dom}) differs from From ({from_dom})"))
+        soft.append((1, f"Message-ID domain ({mid_dom}) differs from From ({from_dom})"))
 
     subject_urgency = set()
     if any(word in subject.lower() for word in URGENCY):
         hit = next(w for w in URGENCY if w in subject.lower())
         subject_urgency = {w for w in URGENCY if w in subject.lower()}
-        findings.append((1, f"Urgency/lure keyword in SUBJECT: '{hit}'"))
+        soft.append((1, f"Urgency/lure keyword in SUBJECT: '{hit}'"))
 
     # ---------- BODY EXTRACTION ----------
     text_body, html_body = '', ''
@@ -601,181 +804,419 @@ def analyze(path):
     raw_body = text_body + ' ' + html_body
 
     # ---------- LINK ANALYSIS ----------
-    # Decode every link so the analyst sees the real destinations. We do not
-    # score "link goes to a domain other than the sender" on its own: legit mail
-    # routinely links to trackers, CDNs and third parties, so it just floods the
-    # report with false positives. The text-vs-href mismatch below is the tell.
+    # Decode every link so the real destinations are visible. We don't score
+    # "links off-domain" by itself; legit mail links to trackers and CDNs all the
+    # time. The checks below look for deliberate disguises instead.
+    raw_urls = URL_RE.findall(raw_body)
     decoded = []
     seen_decoded = set()
-    for u in URL_RE.findall(raw_body):
-        real = decode_proofpoint(u)
+    for u in raw_urls:
+        real = decode_redirect(u)
         if real not in seen_decoded:
             decoded.append(real)
             seen_decoded.add(real)
 
-    # Look-alike destinations: mixed-script homographs and typosquats of the
-    # sender or a known brand. These are deliberate disguises, not noise.
-    from_reg = registrable_domain(from_dom) if from_dom else ''
-    seen_lookalike = set()
+    # Open-redirect cloaking: a link on one site whose query forwards to another.
+    seen_redir = set()
+    for u in raw_urls:
+        tgt = open_redirect_target(u, ESP_DOMAINS | ALLOWLIST)
+        if tgt and tgt not in seen_redir:
+            wrap = registrable_domain(dest_domain(u))
+            hard.append((3, f"Open-redirect link on '{wrap}' forwards to '{tgt}'"))
+            seen_redir.add(tgt)
+
+    seen = {k: set() for k in
+            ('at', 'bad', 'ip', 'homo', 'brand', 'typo', 'short', 'tld',
+             'port', 'deep', 'puny')}
     for real in decoded:
         host = dest_domain(real)
-        if not host or host in seen_lookalike:
+        if not host:
             continue
-        for lab in idn_homograph(host):
-            findings.append((3, f"Mixed-script (homograph) domain in link: '{lab}'"))
-            seen_lookalike.add(host)
         reg = registrable_domain(host)
+        is_esp = reg in ESP_DOMAINS
+
+        # The "@" trick: http://microsoft.com@evil.ru actually goes to evil.ru.
+        try:
+            if urllib.parse.urlparse(real).username and host not in seen['at']:
+                hard.append((3, f"Deceptive '@' in link: real destination is '{host}'"))
+                seen['at'].add(host)
+        except Exception:
+            pass
+
+        if (reg in PHISH_DOMAINS or host in PHISH_DOMAINS) and host not in seen['bad']:
+            hard.append((4, f"Link domain '{reg or host}' is on the known-bad list"))
+            seen['bad'].add(host)
+
+        if _is_ip_host(host) and host not in seen['ip']:
+            hard.append((2, f"Link points to a raw IP address: '{host}'"))
+            seen['ip'].add(host)
+
+        if host not in seen['homo']:
+            homo = idn_homograph(host)
+            for lab in homo:
+                hard.append((3, f"Mixed-script (homograph) domain in link: '{lab}'"))
+                seen['homo'].add(host)
+            # Punycode that isn't an outright homograph is still worth noting.
+            if not homo and 'xn--' in host and host not in seen['puny']:
+                soft.append((1, f"Punycode (internationalized) domain in link: "
+                                f"'{host}' [reads as {decode_idna_host(host)}]"))
+                seen['puny'].add(host)
+
+        # Brand name buried as a subdomain, e.g. microsoft.com.verify-account.ru.
+        if host not in seen['brand']:
+            for b in BRANDS:
+                if ('.' + b + '.') in ('.' + host + '.') and not (
+                        host == b or host.endswith('.' + b)):
+                    hard.append((3, f"Brand domain '{b}' appears inside link host "
+                                    f"but the real domain is '{reg}'"))
+                    seen['brand'].add(host)
+                    break
+
         target = typosquat_target(reg, from_reg)
-        if target and host not in seen_lookalike:
-            findings.append((3, f"Link domain '{reg}' imitates '{target}' (typosquat)"))
-            seen_lookalike.add(host)
+        if target and host not in seen['typo']:
+            hard.append((3, f"Link domain '{reg}' imitates '{target}' (typosquat)"))
+            seen['typo'].add(host)
+
+        # Soft hints, skipped for ESP domains that use these patterns legitimately.
+        if is_esp:
+            continue
+        if reg in SHORTENERS and host not in seen['short']:
+            soft.append((1, f"Shortened link hides its real destination: '{host}'"))
+            seen['short'].add(host)
+        tld = reg.rsplit('.', 1)[-1] if reg else ''
+        if tld and tld in SUSPICIOUS_TLDS and host not in seen['tld']:
+            soft.append((1, f"Link uses a high-abuse TLD ('.{tld}'): '{reg}'"))
+            seen['tld'].add(host)
+        try:
+            port = urllib.parse.urlparse(real).port
+        except Exception:
+            port = None
+        if port not in (None, 80, 443) and host not in seen['port']:
+            soft.append((1, f"Link uses a non-standard port ({port}): '{host}'"))
+            seen['port'].add(host)
+        if host.count('.') >= 5 and host not in seen['deep']:
+            soft.append((1, f"Link host has unusually many subdomains: '{host}'"))
+            seen['deep'].add(host)
 
     seen_mismatch = set()
     for href, text in parser.links:
-        real = decode_proofpoint(href)
+        real = decode_redirect(href)
         real_dom = dest_domain(real)
+        if registrable_domain(real_dom) in ESP_DOMAINS:
+            continue
         claimed = domain_in_text(text)
         if claimed and real_dom and not same_domain_family(claimed, real_dom):
             key = (claimed, real_dom)
             if key not in seen_mismatch:
-                findings.append((3, f"Link DISPLAYS '{claimed}' but actually goes to '{real_dom}'"))
+                hard.append((3, f"Link DISPLAYS '{claimed}' but actually goes to '{real_dom}'"))
                 seen_mismatch.add(key)
+
+    # Anchors whose href is a script or inline-data URI rather than a real link.
+    seen_scheme = set()
+    for href, _text in parser.links:
+        scheme = urllib.parse.urlparse(href).scheme.lower()
+        if scheme in ('javascript', 'data', 'vbscript') and scheme not in seen_scheme:
+            hard.append((2, f"Link uses a '{scheme}:' URI instead of a normal web link"))
+            seen_scheme.add(scheme)
+
+    # A form posting to an external site is a credential trap, and clients usually
+    # strip forms anyway, so any external target stands out.
+    seen_form = set()
+    for action in parser.form_actions:
+        adom = dest_domain(decode_redirect(action))
+        if not adom or adom in seen_form:
+            continue
+        if registrable_domain(adom) in ESP_DOMAINS or same_domain_family(adom, from_dom):
+            continue
+        hard.append((3, f"Form in the email submits to an external domain: '{adom}'"))
+        seen_form.add(adom)
+
+    # Auto-redirect via <meta http-equiv="refresh">; legit mail almost never does.
+    seen_meta = set()
+    for tgt in parser.meta_refresh:
+        mdom = dest_domain(decode_redirect(tgt))
+        if not mdom or mdom in seen_meta:
+            continue
+        if registrable_domain(mdom) in ESP_DOMAINS or same_domain_family(mdom, from_dom):
+            continue
+        hard.append((2, f"Auto-redirect (meta refresh) to '{mdom}'"))
+        seen_meta.add(mdom)
+
+    # Brand named in the text but no link to it. Soft, so a plain mention of a
+    # company name on its own stays quiet.
+    link_regs = {registrable_domain(dest_domain(d)) for d in decoded}
+    link_regs.discard('')
+    ext_regs = sorted(r for r in link_regs if r not in ESP_DOMAINS)
+    if ext_regs:
+        brand_text = (subject + ' ' + visible).lower()
+        for b in BRANDS:
+            bname = b.split('.', 1)[0]
+            if len(bname) < 4:
+                continue
+            if re.search(r'\b' + re.escape(bname) + r'\b', brand_text) and \
+                    not any(same_domain_family(r, b) for r in link_regs):
+                soft.append((1, f"Body mentions '{bname}' but no link goes to {b} "
+                                f"(links: {', '.join(ext_regs[:3])})"))
+                break
 
     # ---------- CONTENT / LANGUAGE SIGNALS ----------
     for phrase in CRED_HARVEST:
         if phrase in visible:
-            findings.append((2, f"Credential-harvesting phrase: '{phrase}'"))
+            soft.append((2, f"Credential-harvesting phrase: '{phrase}'"))
             break
     for greet in GENERIC_GREETINGS:
         if greet in visible:
-            findings.append((1, f"Generic greeting (no real name): '{greet}'"))
+            soft.append((1, f"Generic greeting (no real name): '{greet}'"))
             break
     # Skip subject words already scored above so we don't double-count.
     body_urgency = [w for w in URGENCY if w in visible and w not in subject_urgency]
     if body_urgency:
-        findings.append((1, f"Urgency/pressure language in body (e.g. '{body_urgency[0]}')"))
+        soft.append((1, f"Urgency/pressure language in body (e.g. '{body_urgency[0]}')"))
 
-    # CSS-hidden text. Short hidden text is usually a legit preview/preheader, so
-    # only score it when it carries a lure phrase, which is a real evasion trick.
+    # Hidden text and zero-width tricks are active evasion, so they stay hard
+    # even when the sender authenticates.
     hidden = parser.hidden_text().lower()
     hidden_hit = next((p for p in (CRED_HARVEST + URGENCY) if p in hidden), '')
     if hidden_hit:
-        findings.append((2, f"Hidden (CSS) text contains a lure phrase: '{hidden_hit}'"))
-
+        hard.append((2, f"Hidden (CSS) text contains a lure phrase: '{hidden_hit}'"))
     if _ZW_RE.search(raw_body):
-        findings.append((1, "Zero-width or bidi control characters in body (obfuscation)"))
+        hard.append((1, "Zero-width or bidi control characters in body (obfuscation)"))
 
     # ---------- ATTACHMENTS ----------
-    for name, size, digest, exts in attachments(msg):
-        info.append(f"[Attachment] {name}  ({size} bytes)  sha256={digest}")
+    for name, asize, digest, exts in attachments(msg):
+        info.append(f"[Attachment] {name}  ({asize} bytes)  sha256={digest}")
         last = exts[-1] if exts else ''
         if len(exts) >= 2 and exts[-2] not in DANGEROUS_EXT and last in DANGEROUS_EXT:
-            findings.append((3, f"Misleading double extension on attachment: '{name}'"))
+            hard.append((3, f"Misleading double extension on attachment: '{name}'"))
         elif last in DANGEROUS_EXT:
-            findings.append((3, f"Dangerous attachment type ({last}): '{name}'"))
+            hard.append((3, f"Dangerous attachment type ({last}): '{name}'"))
         elif last in MACRO_EXT:
-            findings.append((2, f"Macro-enabled attachment ({last}): '{name}'"))
+            hard.append((2, f"Macro-enabled attachment ({last}): '{name}'"))
+        elif last in HTML_ATTACH_EXT:
+            hard.append((3, f"HTML/script attachment can host a local phishing page "
+                            f"({last}): '{name}'"))
         elif last in ARCHIVE_EXT:
-            findings.append((1, f"Archive attachment ({last}) may hide a payload: '{name}'"))
+            soft.append((1, f"Archive attachment ({last}) may hide a payload: '{name}'"))
 
-    return findings, info, decoded, pp, pp_flagged
+    # ---------- CORROBORATION GATE ----------
+    # Language signals only count when a hard signal also fired and the sender
+    # didn't pass DMARC or sit on the allowlist. Otherwise they show as context.
+    # This gate is what keeps the false-positive rate down.
+    allowlisted = bool(from_reg) and (from_reg in ALLOWLIST or from_dom in ALLOWLIST)
+    trusted = dmarc_pass or allowlisted
+    count_soft = bool(hard) and not trusted
+
+    findings = list(hard)
+    context = []
+    if count_soft:
+        findings.extend(soft)
+    elif soft:
+        context = list(soft)
+        if trusted:
+            why = "sender passed DMARC" if dmarc_pass else "sender is on your allowlist"
+            info.append(f"[note] Language signals below not scored ({why}).")
+        else:
+            info.append("[note] Language signals below not scored (no structural "
+                        "signal to corroborate them).")
+
+    return findings, context, info, decoded, pp, pp_flagged
 
 
 def _hdr(title):
     return c(f"=== {title} ===", BRAND, BOLD)
 
 
-def report(findings, info, decoded, pp, pp_flagged, quiet=False, verbose=False):
-    score = sum(w for w, _ in findings)
-
+def verdict_for(score):
     if score >= 6:
-        verdict, vcolor = "HIGH - strong phishing indicators", RED
-    elif score >= 3:
-        verdict, vcolor = "MEDIUM - suspicious, investigate further", YELLOW
-    elif score >= 1:
-        verdict, vcolor = "LOW - minor signals, likely benign but verify", CYAN
-    else:
-        verdict, vcolor = "MINIMAL - no scored signals", GREEN
+        return "HIGH - strong phishing indicators", RED
+    if score >= 3:
+        return "MEDIUM - suspicious, investigate further", YELLOW
+    if score >= 1:
+        return "LOW - minor signals, likely benign but verify", CYAN
+    return "MINIMAL - no scored signals", GREEN
 
+
+# Headings the SIGNALS/CONTEXT sections are grouped under, in print order.
+_SIGNAL_GROUPS = ('Authentication', 'Sender / headers', 'Links',
+                  'Attachments', 'Content')
+
+
+def _signal_group(desc):
+    """Bucket a finding by its text. Display only; the finding tuples are
+    untouched, so a wrong guess just files a line under a different heading."""
+    d = desc.lower()
+    if any(k in d for k in ('spf ', 'dkim', 'dmarc', 'proofpoint itself flagged',
+                            'authentication-results')):
+        return 'Authentication'
+    if 'attachment' in d or 'extension' in d:
+        return 'Attachments'
+    if any(k in d for k in ('reply-to', 'return-path', 'message-id',
+                            'display name', 'sender domain', 'from freemail',
+                            'homograph) sender')):
+        return 'Sender / headers'
+    if any(k in d for k in ('link', 'redirect', 'brand domain', 'form ',
+                            'punycode', "'@'", 'ip address', 'shorten', 'tld',
+                            'port', 'subdomain', 'body mentions', ' uri ')):
+        return 'Links'
+    return 'Content'
+
+
+def _print_grouped(items, scored):
+    by_group = {}
+    for w, desc in items:
+        by_group.setdefault(_signal_group(desc), []).append((w, desc))
+    for group in _SIGNAL_GROUPS:
+        rows = by_group.get(group)
+        if not rows:
+            continue
+        rows.sort(key=lambda r: -r[0])
+        print(c(f"  {group}", BOLD))
+        for w, desc in rows:
+            tag = c(f'[+{w}]', weight_color(w), BOLD) if scored else c('[ ]', DIM)
+            print(f"    {tag} {sanitize(desc)}")
+
+
+def report(findings, context, info, decoded, pp, pp_flagged,
+           quiet=False, verbose=False):
+    score = sum(w for w, _ in findings)
+    verdict, vcolor = verdict_for(score)
     meter = risk_meter(score, vcolor)
-    verdict_line = (f"=== RISK SCORE: {score}  {meter}  "
-                    f"{c(verdict, vcolor, BOLD)} ===")
+    verdict_line = f"RISK SCORE {score}  {meter}  {c(verdict, vcolor, BOLD)}"
 
     if quiet:
         print(verdict_line)
         return
 
+    # Lead with the answer: verdict plus the heaviest few signals.
+    print("\n" + _hdr("VERDICT"))
+    print("  " + verdict_line)
+    for w, desc in sorted(findings, key=lambda f: -f[0])[:3]:
+        print(f"    {c(f'[+{w}]', weight_color(w), BOLD)} {sanitize(desc)}")
+
     print("\n" + _hdr("HEADER SUMMARY"))
     for line in info:
         print("  " + sanitize(line))
 
-    print("\n" + _hdr("LINKS (Proofpoint-decoded)"))
+    print("\n" + _hdr("LINKS (decoded)"))
     if decoded:
         shown = decoded if verbose else decoded[:25]
         for d in shown:
-            print("  -> " + sanitize(d))
+            line = "  -> " + sanitize(d)
+            host = dest_domain(d)
+            if 'xn--' in host:
+                line += sanitize("   [reads as: " + decode_idna_host(host) + "]")
+            print(line)
         if not verbose and len(decoded) > 25:
             print(c(f"  ... +{len(decoded) - 25} more (use --verbose to show all)", DIM))
     else:
         print("  (no links found)")
 
     print("\n" + _hdr("SIGNALS"))
-    if not findings:
+    if findings:
+        _print_grouped(findings, scored=True)
+    else:
         print("  (no scored signals fired)")
-    for w, desc in findings:
-        print(f"  {c(f'[+{w}]', weight_color(w), BOLD)} {sanitize(desc)}")
 
-    print("\n" + verdict_line)
+    if context:
+        print("\n" + _hdr("CONTEXT (not scored)"))
+        _print_grouped(context, scored=False)
 
     if pp:
         print("\nProofpoint detected: raw SPF/DKIM/DMARC fails scored LOW (they")
         print("break on clean mail here). " + (
             "PPS flagged this - weight heavily." if pp_flagged
             else "PPS did not flag it (context)."))
-    print(c("\nNote: content signals (greetings, urgency, phrasing) are soft;", DIM))
-    print(c("modern AI-written phishing has clean grammar and personalized", DIM))
-    print(c("greetings. The strongest evidence is the decoded link destinations,", DIM))
-    print(c("link-text/href mismatches, and Proofpoint's own verdict.", DIM))
+    print(c("\nNote: language signals (greetings, urgency, phrasing) count toward", DIM))
+    print(c("the score only when a structural signal also fired and the sender is", DIM))
+    print(c("not authenticated or allowlisted; otherwise they are listed as context.", DIM))
+    print(c("The strongest evidence is the decoded link destinations, link-text/href", DIM))
+    print(c("mismatches, known-bad hits, and Proofpoint's own verdict.", DIM))
 
 
-USAGE = "Usage: python phish-analyzer.py [-q|--quiet] [-v|--verbose] <email.eml>"
+USAGE = ("Usage: python phish-analyzer.py [-q|--quiet] [-v|--verbose] "
+         "<email.eml | folder> [more...]")
+
+
+def _gather_targets(args):
+    """Expand the given files and folders into a list of .eml paths."""
+    targets = []
+    for a in args:
+        if os.path.isdir(a):
+            for name in sorted(os.listdir(a)):
+                if name.lower().endswith('.eml'):
+                    targets.append(os.path.join(a, name))
+        else:
+            targets.append(a)
+    return targets
+
+
+def _analyze_capture(path):
+    """Run analyze() but turn any failure into an error string for batch runs."""
+    try:
+        return analyze(path), None
+    except FileNotFoundError:
+        return None, "file not found"
+    except (OSError, ValueError) as exc:
+        return None, sanitize(str(exc))
+    except Exception as exc:
+        return None, f"{type(exc).__name__}: {sanitize(str(exc))}"
+
+
+def _summary_row(path, result, error):
+    name = sanitize(os.path.basename(path))
+    if error:
+        return f"  {c('ERROR   ', RED, BOLD)} {name}  ({error})"
+    score = sum(w for w, _ in result[0])
+    verdict, vcolor = verdict_for(score)
+    tier = verdict.split(' ', 1)[0]
+    return f"  {c(f'{tier:<8}', vcolor, BOLD)} score {score:<3}  {name}"
 
 
 def main():
     quiet = verbose = False
-    paths = []
+    args = []
     for arg in sys.argv[1:]:
         if arg in ('-q', '--quiet'):
             quiet = True
         elif arg in ('-v', '--verbose'):
             verbose = True
         else:
-            paths.append(arg)
+            args.append(arg)
 
     if quiet and verbose:
         print("[ERROR] --quiet and --verbose are mutually exclusive.")
         sys.exit(1)
-    if not paths:
+    if not args:
         print(USAGE)
         sys.exit(1)
-    path = paths[0]
-    safe_path = sanitize(path)
+
+    targets = _gather_targets(args)
+    if not targets:
+        print("[ERROR] No .eml files found in the given path(s).")
+        sys.exit(1)
+
+    # One file gets the full report; several get a one-line-per-file table.
+    if len(targets) == 1:
+        path = targets[0]
+        if not quiet:
+            print_banner()
+            print(f"Analyzing {sanitize(os.path.basename(path))}...")
+        result, error = _analyze_capture(path)
+        if error:
+            print(f"[ERROR] Could not analyze {sanitize(path)}: {error}")
+            sys.exit(1)
+        report(*result, quiet=quiet, verbose=verbose)
+        return
 
     if not quiet:
         print_banner()
-        print(f"Analyzing {safe_path}...")
-    try:
-        findings, info, decoded, pp, pp_flagged = analyze(path)
-    except FileNotFoundError:
-        print(f"[ERROR] File not found: {safe_path}")
-        sys.exit(1)
-    except (OSError, ValueError) as exc:
-        print(f"[ERROR] Could not read {safe_path}: {sanitize(str(exc))}")
-        sys.exit(1)
-    except Exception as exc:
-        print(f"[ERROR] Failed to parse email: {type(exc).__name__}: {sanitize(str(exc))}")
-        sys.exit(1)
-    report(findings, info, decoded, pp, pp_flagged, quiet=quiet, verbose=verbose)
+        print(f"Scanning {len(targets)} files...\n")
+    print(_hdr("BATCH SUMMARY"))
+    for path in targets:
+        result, error = _analyze_capture(path)
+        print(_summary_row(path, result, error))
+    if not quiet:
+        print(c("\nRun a single file for the full report.", DIM))
 
 
 if __name__ == '__main__':

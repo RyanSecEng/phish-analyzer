@@ -1,0 +1,113 @@
+# Major legitimate domains that should never be treated as known-bad, even if a
+# public feed lists one of them (compromised-page reports and bad entries happen).
+# update_feeds.py drops any feed host whose domain equals or is a subdomain of an
+# entry here, so the auto-generated blocklist can't flag google.com and friends.
+#
+# This is a safety net, not an allowlist for scoring. One domain per line.
+# Do NOT add shared free-hosting domains here (000webhostapp.com, weebly.com,
+# etc.): real phishing lives on their subdomains and we want to keep those.
+
+# search / portals / big tech
+google.com
+google.co.uk
+googleapis.com
+gstatic.com
+youtube.com
+youtu.be
+bing.com
+duckduckgo.com
+yahoo.com
+microsoft.com
+microsoftonline.com
+office.com
+office365.com
+live.com
+outlook.com
+windows.com
+azure.com
+apple.com
+icloud.com
+amazon.com
+amazonaws.com
+aws.amazon.com
+cloudflare.com
+akamai.com
+fastly.net
+wikipedia.org
+mozilla.org
+
+# social / comms
+facebook.com
+fb.com
+instagram.com
+whatsapp.com
+twitter.com
+x.com
+linkedin.com
+reddit.com
+tiktok.com
+snapchat.com
+pinterest.com
+telegram.org
+discord.com
+slack.com
+zoom.us
+
+# payments / finance
+paypal.com
+stripe.com
+squareup.com
+venmo.com
+wise.com
+intuit.com
+visa.com
+mastercard.com
+americanexpress.com
+chase.com
+bankofamerica.com
+wellsfargo.com
+citi.com
+capitalone.com
+usbank.com
+hsbc.com
+barclays.com
+santander.com
+
+# commerce / shipping
+ebay.com
+etsy.com
+walmart.com
+target.com
+bestbuy.com
+costco.com
+ups.com
+fedex.com
+usps.com
+dhl.com
+
+# cloud / dev / saas
+github.com
+gitlab.com
+atlassian.com
+dropbox.com
+box.com
+adobe.com
+salesforce.com
+oracle.com
+ibm.com
+servicenow.com
+workday.com
+okta.com
+docusign.com
+docusign.net
+zendesk.com
+hubspot.com
+
+# media / streaming / cdn
+netflix.com
+spotify.com
+hulu.com
+disneyplus.com
+twitch.tv
+cloudfront.net
+googleusercontent.com

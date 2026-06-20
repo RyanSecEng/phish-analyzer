@@ -1,0 +1,6 @@
+# Hand-curated known-bad domains. A link to one is a hard +4 signal. One host or
+# domain per line; '#' is a comment.
+#
+# This is for entries you keep (e.g. from your own incidents). It's unioned with
+# phish_domains.feed.txt, the larger gitignored file that `python update_feeds.py`
+# pulls from public blocklists. Add your own below:

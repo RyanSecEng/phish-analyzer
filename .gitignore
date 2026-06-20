@@ -21,3 +21,6 @@ Thumbs.db
 # Local config
 *.local
 config.local.*
+
+# Auto-generated phishing feed (large, changes daily) - refresh with update_feeds.py
+phish_domains.feed.txt

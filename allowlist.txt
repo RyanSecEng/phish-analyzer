@@ -1,0 +1,8 @@
+# Sender domains you trust. Their soft language signals (urgency, greetings, etc.)
+# become context instead of scoring, the same way a DMARC pass does. Hard signals
+# (bad links, attachments, spoofed names) still score - this only quiets the noisy
+# language checks, it doesn't whitelist a domain outright.
+#
+# Empty by default. Add your own org and trusted vendors, one domain per line:
+# yourcompany.com
+# trusted-vendor.com

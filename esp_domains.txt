@@ -1,0 +1,159 @@
+# Email service providers, bulk-mail relays and trackers. Links and header
+# mismatches on these are normal for marketing and transactional mail, so the
+# analyzer skips its softer link checks for them. Add senders you see getting
+# over-flagged. One domain per line; '#' is a comment.
+
+# --- Mailchimp / Intuit ---
+mailchimp.com
+list-manage.com
+mcsv.net
+mcdlv.net
+rsgsv.net
+
+# --- Twilio SendGrid ---
+sendgrid.net
+sendgrid.com
+sendgrid.info
+
+# --- Amazon SES ---
+amazonses.com
+amazonaws.com
+
+# --- Mailgun (Sinch) ---
+mailgun.org
+mailgun.net
+mg.mailgun.org
+
+# --- SparkPost / MessageBird ---
+sparkpostmail.com
+sparkpost.com
+
+# --- Mandrill ---
+mandrillapp.com
+mandrill.com
+
+# --- Salesforce Marketing Cloud / ExactTarget ---
+exct.net
+exacttarget.com
+salesforce.com
+pardot.com
+
+# --- HubSpot ---
+hubspotemail.net
+hubspot.com
+hs-success.net
+hubspotusercontent.com
+
+# --- Constant Contact ---
+constantcontact.com
+rs6.net
+
+# --- Brevo (Sendinblue) ---
+sendinblue.com
+sibautomation.com
+brevo.com
+
+# --- Klaviyo ---
+klaviyomail.com
+klaviyo.com
+
+# --- Marketo (Adobe) ---
+mktomail.com
+marketo.com
+
+# --- Postmark / ActiveCampaign / Campaign Monitor / Mailjet ---
+mtasv.net
+pmailrtr.com
+activehosted.com
+createsend.com
+cmail19.com
+cmail20.com
+mailjet.com
+mlsend.com
+
+# --- Microsoft / Google / Apple mail infrastructure ---
+protection.outlook.com
+outlook.com
+office365.com
+microsoft.com
+google.com
+googlemail.com
+sendgrid.me
+icloud.com
+
+# --- Survey / docs / e-sign senders that legitimately send on behalf of others ---
+docusign.net
+docusign.com
+echosign.com
+adobesign.com
+surveymonkey.com
+qualtrics-research.com
+zendesk.com
+freshemail.io
+intercom-mail.com
+customeriomail.com
+
+# --- Zoho / Oracle / Adobe / SAP marketing clouds ---
+zoho.com
+zohomail.com
+zcsend.net
+eloqua.com
+en25.com
+rsys2.net
+responsys.net
+mktdns.com
+sap.com
+emarsys.net
+
+# --- More ESPs / transactional senders ---
+getresponse.com
+gr-cdn.com
+aweber.com
+send.aweber.com
+drip.com
+omnisend.com
+iterable.com
+braze.com
+sendpulse.com
+elasticemail.com
+smtp2go.com
+socketlabs.com
+pepipost.com
+netcorecloud.net
+moosend.com
+listrak.com
+cordialmail.net
+sailthru.com
+dotmailer.com
+dotdigital.com
+maropost.com
+vresp.com
+icontact.com
+benchmarkemail.com
+ed10.net
+mailersend.net
+postmarkapp.com
+
+# --- Big-sender bulk/transactional sending domains (not the brand primaries) ---
+facebookmail.com
+e.linkedin.com
+bounce.linkedin.com
+e.paypal.com
+reply.github.com
+notifications.google.com
+em.engagement.zoom.us
+mail.notion.so
+email.apple.com
+news.microsoft.com
+
+# --- Common click / open trackers ---
+sendgrid.net
+spmailtechno.com
+spgo.io
+mkt.com
+clicks.aweber.com
+links.notifications.com
+ct.sendgrid.net
+url1234.com
+go.pardot.com
+hubspotlinks.com

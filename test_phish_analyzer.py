@@ -100,7 +100,7 @@ class EndToEndTests(unittest.TestCase):
         )
         path = _write_eml(eml)
         try:
-            findings, info, decoded, pp, pp_flagged = pa.analyze(path)
+            findings, context, info, decoded, pp, pp_flagged = pa.analyze(path)
         finally:
             os.remove(path)
         score = sum(w for w, _ in findings)
@@ -118,7 +118,7 @@ class EndToEndTests(unittest.TestCase):
         )
         path = _write_eml(eml)
         try:
-            findings, info, decoded, pp, pp_flagged = pa.analyze(path)
+            findings, context, info, decoded, pp, pp_flagged = pa.analyze(path)
         finally:
             os.remove(path)
         score = sum(w for w, _ in findings)
@@ -141,7 +141,7 @@ class EndToEndTests(unittest.TestCase):
         )
         path = _write_eml(eml)
         try:
-            findings, info, decoded, pp, pp_flagged = pa.analyze(path)
+            findings, context, info, decoded, pp, pp_flagged = pa.analyze(path)
         finally:
             os.remove(path)
         score = sum(w for w, _ in findings)
@@ -215,7 +215,7 @@ class AttachmentTests(unittest.TestCase):
         )
         path = _write_eml(eml)
         try:
-            findings, info, decoded, pp, pp_flagged = pa.analyze(path)
+            findings, context, info, decoded, pp, pp_flagged = pa.analyze(path)
         finally:
             os.remove(path)
         self.assertIn("double extension", _descs(findings))
@@ -244,7 +244,7 @@ class AttachmentTests(unittest.TestCase):
         )
         path = _write_eml(eml)
         try:
-            findings, info, decoded, pp, pp_flagged = pa.analyze(path)
+            findings, context, info, decoded, pp, pp_flagged = pa.analyze(path)
         finally:
             os.remove(path)
         self.assertEqual(sum(w for w, _ in findings), 0)
@@ -265,7 +265,7 @@ class HiddenContentTests(unittest.TestCase):
         )
         path = _write_eml(eml)
         try:
-            findings, info, decoded, pp, pp_flagged = pa.analyze(path)
+            findings, context, info, decoded, pp, pp_flagged = pa.analyze(path)
         finally:
             os.remove(path)
         descs = _descs(findings)
@@ -287,7 +287,7 @@ class HiddenContentTests(unittest.TestCase):
         )
         path = _write_eml(eml)
         try:
-            findings, info, decoded, pp, pp_flagged = pa.analyze(path)
+            findings, context, info, decoded, pp, pp_flagged = pa.analyze(path)
         finally:
             os.remove(path)
         self.assertEqual(sum(w for w, _ in findings), 0)
@@ -307,10 +307,279 @@ class TyposquatLinkTests(unittest.TestCase):
         )
         path = _write_eml(eml)
         try:
-            findings, info, decoded, pp, pp_flagged = pa.analyze(path)
+            findings, context, info, decoded, pp, pp_flagged = pa.analyze(path)
         finally:
             os.remove(path)
         self.assertIn("imitates 'paypal.com'", _descs(findings))
+
+
+def _analyze(eml):
+    """Analyze an .eml string and return the full result tuple."""
+    path = _write_eml(eml)
+    try:
+        return pa.analyze(path)
+    finally:
+        os.remove(path)
+
+
+class GetDomainSpoofTests(unittest.TestCase):
+    def test_uses_real_address_not_display_name(self):
+        # An '@domain' planted in the display name must not be read as the sender.
+        self.assertEqual(
+            pa.get_domain('"billing@paypal.com" <real@evil.ru>'), "evil.ru")
+
+    def test_plain_address(self):
+        self.assertEqual(pa.get_domain("Bob <bob@Example.COM>"), "example.com")
+
+
+class DisplayNameSpoofTests(unittest.TestCase):
+    def test_address_in_display_name_mismatch_is_flagged(self):
+        eml = (
+            'From: "billing@paypal.com" <attacker@scam-domain.tld>\n'
+            "Subject: hello\n"
+            "Authentication-Results: gw.test; dmarc=fail\n"
+            "Content-Type: text/plain\n\n"
+            "Hi.\n"
+        )
+        findings, _ctx, _info, _dec, _pp, _ppf = _analyze(eml)
+        self.assertIn("display name claims 'paypal.com'", _descs(findings))
+
+
+class SenderLookalikeTests(unittest.TestCase):
+    def test_sender_domain_typosquat_is_flagged(self):
+        eml = (
+            "From: PayPal <service@paypa1.com>\n"
+            "Subject: notice\n"
+            "Authentication-Results: gw.test; spf=pass; dkim=pass; dmarc=pass\n"
+            "Content-Type: text/plain\n\n"
+            "Hello.\n"
+        )
+        findings, _ctx, _info, _dec, _pp, _ppf = _analyze(eml)
+        # Hard signal: a DMARC pass must not suppress it.
+        self.assertIn("imitates 'paypal.com'", _descs(findings))
+
+
+class AuthTrustTests(unittest.TestCase):
+    def test_forged_lower_authresults_does_not_grant_trust(self):
+        # Top (trusted) header fails; a forged lower header claims pass. The
+        # forged pass must NOT move soft language signals into context.
+        eml = (
+            "From: Account Team <noreply@unrelated-domain.example>\n"
+            "Subject: please verify your account\n"
+            "Authentication-Results: gw.mycorp.test; dmarc=fail\n"
+            "Authentication-Results: attacker-supplied; dmarc=pass\n"
+            "Content-Type: text/html\n\n"
+            "<html><body>Dear user, please verify your account."
+            '<a href="https://paypa1.com/login">click</a></body></html>\n'
+        )
+        findings, _ctx, info, _dec, _pp, _ppf = _analyze(eml)
+        descs = _descs(findings)
+        self.assertIn("imitates 'paypal.com'", descs)        # hard signal present
+        self.assertIn("verify your account", descs)          # soft, still SCORED
+        self.assertTrue(any("not treated as trusted" in i for i in info))
+
+    def test_top_header_pass_is_trusted(self):
+        eml = (
+            "From: News <news@example.com>\n"
+            "Subject: please verify your account now\n"
+            "Authentication-Results: gw.mycorp.test; dmarc=pass\n"
+            "Content-Type: text/plain\n\n"
+            "Dear user, please verify your account.\n"
+        )
+        findings, context, _info, _dec, _pp, _ppf = _analyze(eml)
+        # No hard signal + trusted => language signals parked in context, score 0.
+        self.assertEqual(sum(w for w, _ in findings), 0)
+        self.assertTrue(context)
+
+
+class HeaderMismatchTests(unittest.TestCase):
+    def test_returnpath_mismatch_not_scored_when_dmarc_passes(self):
+        eml = (
+            "From: News <news@example.com>\n"
+            "Return-Path: <bounce@example.net>\n"
+            "Subject: Weekly update\n"
+            "Authentication-Results: gw.test; spf=pass; dkim=pass; dmarc=pass\n"
+            "Message-ID: <1@example.com>\n"
+            "Content-Type: text/plain\n\n"
+            "Here is your weekly update.\n"
+        )
+        findings, _ctx, _info, _dec, _pp, _ppf = _analyze(eml)
+        self.assertEqual(sum(w for w, _ in findings), 0)
+
+    def test_replyto_to_freemail_is_hard_even_with_dmarc_pass(self):
+        eml = (
+            "From: CEO <ceo@company-corp.example>\n"
+            "Reply-To: ceo.personal@gmail.com\n"
+            "Subject: quick task\n"
+            "Authentication-Results: gw.test; spf=pass; dkim=pass; dmarc=pass\n"
+            "Content-Type: text/plain\n\n"
+            "Are you at your desk?\n"
+        )
+        findings, _ctx, _info, _dec, _pp, _ppf = _analyze(eml)
+        self.assertIn("reply-to points to an unrelated address", _descs(findings))
+
+
+class HtmlAttachmentTests(unittest.TestCase):
+    def test_html_attachment_is_flagged(self):
+        eml = (
+            "From: Alice <alice@example.com>\n"
+            "Subject: invoice\n"
+            "Authentication-Results: gw.test; dmarc=pass\n"
+            'Content-Type: multipart/mixed; boundary="b"\n\n'
+            "--b\n"
+            "Content-Type: text/plain\n\n"
+            "See attached.\n"
+            "--b\n"
+            "Content-Type: text/html\n"
+            'Content-Disposition: attachment; filename="invoice.html"\n\n'
+            "<html><body>login here</body></html>\n"
+            "--b--\n"
+        )
+        findings, _ctx, _info, _dec, _pp, _ppf = _analyze(eml)
+        self.assertIn("html/script attachment", _descs(findings))
+
+
+class HtmlLinkTrickTests(unittest.TestCase):
+    def test_external_form_action_is_flagged(self):
+        eml = (
+            "From: Alice <alice@example.com>\n"
+            "Subject: form\n"
+            "Authentication-Results: gw.test; dmarc=pass\n"
+            "Content-Type: text/html\n\n"
+            '<html><body><form action="https://harvest.evil-site.example/login">'
+            '<input name="pw"></form></body></html>\n'
+        )
+        findings, _ctx, _info, _dec, _pp, _ppf = _analyze(eml)
+        self.assertIn("form in the email submits to an external domain",
+                      _descs(findings))
+
+    def test_meta_refresh_is_flagged(self):
+        eml = (
+            "From: Alice <alice@example.com>\n"
+            "Subject: redirect\n"
+            "Authentication-Results: gw.test; dmarc=pass\n"
+            "Content-Type: text/html\n\n"
+            '<html><head><meta http-equiv="refresh" '
+            'content="0;url=https://go.evil-site.example/x"></head>'
+            "<body>hi</body></html>\n"
+        )
+        findings, _ctx, _info, _dec, _pp, _ppf = _analyze(eml)
+        self.assertIn("auto-redirect (meta refresh)", _descs(findings))
+
+    def test_javascript_href_is_flagged(self):
+        eml = (
+            "From: Alice <alice@example.com>\n"
+            "Subject: js\n"
+            "Authentication-Results: gw.test; dmarc=pass\n"
+            "Content-Type: text/html\n\n"
+            '<html><body><a href="javascript:steal()">click</a></body></html>\n'
+        )
+        findings, _ctx, _info, _dec, _pp, _ppf = _analyze(eml)
+        self.assertIn("'javascript:' uri", _descs(findings))
+
+
+class ReportSmokeTests(unittest.TestCase):
+    """Guards the crash class where analyze()/report() signatures drift apart."""
+    def _render(self, eml):
+        import contextlib
+        import io
+        result = _analyze(eml)
+        self.assertEqual(len(result), 6)  # report() unpacks exactly six values
+        findings, context, info, decoded, pp, pp_flagged = result
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            pa.report(findings, context, info, decoded, pp, pp_flagged, quiet=True)
+            pa.report(findings, context, info, decoded, pp, pp_flagged)
+            pa.report(findings, context, info, decoded, pp, pp_flagged, verbose=True)
+        return buf.getvalue()
+
+    def test_report_renders_clean_mail(self):
+        out = self._render(
+            "From: Alice <alice@example.com>\n"
+            "Subject: lunch\n"
+            "Authentication-Results: gw.test; dmarc=pass\n"
+            "Content-Type: text/plain\n\nHi Bob.\n")
+        self.assertIn("RISK SCORE", out)
+
+    def test_report_renders_phish_with_context(self):
+        out = self._render(
+            "From: IT Security <x@gmail.com>\n"
+            "Subject: urgent verify your account\n"
+            "Authentication-Results: gw.test; dmarc=fail\n"
+            "Content-Type: text/html\n\n"
+            '<html><body>Dear user<a href="https://paypa1.com">paypal.com</a>'
+            "</body></html>\n")
+        self.assertIn("RISK SCORE", out)
+        self.assertIn("SIGNALS", out)
+
+
+class VerdictTierTests(unittest.TestCase):
+    def test_tiers(self):
+        self.assertEqual(pa.verdict_for(0)[0].split()[0], "MINIMAL")
+        self.assertEqual(pa.verdict_for(2)[0].split()[0], "LOW")
+        self.assertEqual(pa.verdict_for(4)[0].split()[0], "MEDIUM")
+        self.assertEqual(pa.verdict_for(8)[0].split()[0], "HIGH")
+
+
+class SignalGroupTests(unittest.TestCase):
+    def test_buckets(self):
+        cases = {
+            "SPF failed": "Authentication",
+            "DMARC failed": "Authentication",
+            "Reply-To points to an unrelated address (gmail.com) while From is x":
+                "Sender / headers",
+            "Sender domain 'paypa1.com' imitates 'paypal.com' (typosquat)":
+                "Sender / headers",
+            "Link domain 'x.tk' is on the known-bad list": "Links",
+            "Form in the email submits to an external domain: 'evil.ru'": "Links",
+            "Dangerous attachment type (.exe): 'x.exe'": "Attachments",
+            "Credential-harvesting phrase: 'verify your account'": "Content",
+        }
+        for desc, group in cases.items():
+            self.assertEqual(pa._signal_group(desc), group, desc)
+
+
+class ReportLayoutTests(unittest.TestCase):
+    def test_verdict_heading_and_groups_render(self):
+        import contextlib
+        import io
+        result = _analyze(
+            "From: IT Security <x@gmail.com>\n"
+            "Subject: urgent verify your account\n"
+            "Authentication-Results: gw.test; spf=fail; dmarc=fail\n"
+            "Content-Type: text/html\n\n"
+            '<html><body>Dear user'
+            '<a href="https://paypa1.com">paypal.com</a></body></html>\n')
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            pa.report(*result)
+        out = buf.getvalue()
+        self.assertIn("VERDICT", out)
+        self.assertIn("SIGNALS", out)
+        self.assertIn("Links", out)        # group heading
+
+
+class BatchTests(unittest.TestCase):
+    def test_gather_targets_expands_dir_to_eml_only(self):
+        d = tempfile.mkdtemp()
+        for fn in ("a.eml", "b.eml", "notes.txt"):
+            with open(os.path.join(d, fn), "w", encoding="utf-8") as fh:
+                fh.write("x")
+        targets = pa._gather_targets([d])
+        self.assertEqual([os.path.basename(t) for t in targets], ["a.eml", "b.eml"])
+
+    def test_summary_row_ok_and_error(self):
+        result = _analyze(
+            "From: Alice <alice@example.com>\n"
+            "Subject: hi\n"
+            "Authentication-Results: gw.test; dmarc=pass\n"
+            "Content-Type: text/plain\n\nHi.\n")
+        ok = pa._summary_row("/tmp/clean.eml", result, None)
+        self.assertIn("MINIMAL", ok)
+        self.assertIn("clean.eml", ok)
+        err = pa._summary_row("/tmp/bad.eml", None, "boom")
+        self.assertIn("ERROR", err)
+        self.assertIn("boom", err)
 
 
 if __name__ == "__main__":
