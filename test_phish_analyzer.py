@@ -790,5 +790,33 @@ class ColorInfoTests(unittest.TestCase):
             self.assertEqual(pa._color_info(line), line)
 
 
+class PdfActiveContentTests(unittest.TestCase):
+    def _eml_with_pdf(self, pdf_bytes):
+        import base64
+        b64 = base64.b64encode(pdf_bytes).decode()
+        return (
+            "From: a <a@example.com>\n"
+            "Subject: invoice\n"
+            "Authentication-Results: gw.test; dmarc=pass\n"
+            'Content-Type: multipart/mixed; boundary="b"\n\n'
+            "--b\nContent-Type: text/plain\n\nsee attached\n"
+            "--b\n"
+            "Content-Type: application/pdf\n"
+            'Content-Disposition: attachment; filename="invoice.pdf"\n'
+            "Content-Transfer-Encoding: base64\n\n" + b64 + "\n--b--\n")
+
+    def test_active_content_flagged_strong(self):
+        pdf = (b"%PDF-1.4\n1 0 obj<< /OpenAction << /S /JavaScript "
+               b"/JS (app.alert('x')) >> >>\n%%EOF\n")
+        findings, _c, _i, _d, _p, _pf = _analyze(self._eml_with_pdf(pdf))
+        self.assertIn("pdf attachment has active content", _descs(findings))
+        self.assertTrue(any(w == 3 and "active content" in d for w, d in findings))
+
+    def test_benign_pdf_not_flagged(self):
+        pdf = b"%PDF-1.4\n1 0 obj<< /Type /Catalog >>\ntrailer\n%%EOF\n"
+        findings, _c, _i, _d, _p, _pf = _analyze(self._eml_with_pdf(pdf))
+        self.assertNotIn("active content", _descs(findings))
+
+
 if __name__ == "__main__":
     unittest.main()

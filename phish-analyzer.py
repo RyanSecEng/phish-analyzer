@@ -156,6 +156,9 @@ MACRO_EXT = {'.docm', '.xlsm', '.pptm', '.dotm', '.xlam', '.xltm', '.potm'}
 ARCHIVE_EXT = {'.zip', '.rar', '.7z', '.ace', '.cab', '.gz', '.tar', '.iso'}
 # HTML/SVG attachments open a local phishing page, or run script (svg).
 HTML_ATTACH_EXT = {'.html', '.htm', '.shtml', '.xhtml', '.mht', '.mhtml', '.svg'}
+# PDF markers for active content. Matched as raw bytes (no PDF parsing); a
+# compressed object stream can still hide these, so it's best-effort.
+PDF_ACTIVE = (b'/JavaScript', b'/OpenAction', b'/Launch', b'/EmbeddedFile')
 
 SKIP_TAGS = {'script', 'style'}
 
@@ -713,11 +716,9 @@ def domain_in_text(text):
 
 
 def attachments(msg):
-    """Yield (filename, size, sha256, extensions) for each attached part.
-
-    `extensions` is the list of trailing extensions, so a double extension like
-    invoice.pdf.exe comes back as ['.pdf', '.exe'] for the caller to judge.
-    """
+    """Yield (filename, size, sha256, extensions, pdf_active) for each attached
+    part. `extensions` is the trailing extensions (invoice.pdf.exe -> ['.pdf',
+    '.exe']); `pdf_active` lists active-content markers found in a PDF payload."""
     for part in msg.walk():
         if part.get_content_maintype() == 'multipart':
             continue
@@ -727,7 +728,10 @@ def attachments(msg):
         payload = part.get_payload(decode=True) or b''
         name = sanitize(fn or '(unnamed)')
         exts = [e.lower() for e in re.findall(r'\.[A-Za-z0-9]{1,8}', name)][-2:]
-        yield name, len(payload), hashlib.sha256(payload).hexdigest(), exts
+        pdf_active = []
+        if b'%PDF-' in payload[:1024]:  # byte search only, never parse the PDF
+            pdf_active = [t[1:].decode() for t in PDF_ACTIVE if t in payload]
+        yield name, len(payload), hashlib.sha256(payload).hexdigest(), exts, pdf_active
 
 
 def analyze(path):
@@ -1144,7 +1148,7 @@ def analyze(path):
         hard.append((1, "Zero-width or bidi control characters in body (obfuscation)"))
 
     # ---------- ATTACHMENTS ----------
-    for i, (name, asize, digest, exts) in enumerate(attachments(msg)):
+    for i, (name, asize, digest, exts, pdf_active) in enumerate(attachments(msg)):
         if i >= _MAX_ATTACH:
             break
         info.append(f"[Attachment] {name}  ({asize} bytes)  sha256={digest}")
@@ -1160,6 +1164,12 @@ def analyze(path):
                             f"({last}): '{name}'"))
         elif last in ARCHIVE_EXT:
             soft.append((1, f"Archive attachment ({last}) may hide a payload: '{name}'"))
+        # Active content in a PDF: auto-run actions weigh heavier than embedded JS.
+        if pdf_active:
+            strong = any(t in ('OpenAction', 'Launch') for t in pdf_active)
+            hard.append((3 if strong else 2,
+                         f"PDF attachment has active content "
+                         f"({', '.join(pdf_active)}): '{name}'"))
 
     # ---------- CORROBORATION GATE ----------
     # Language signals only count when a hard signal also fired and the sender
