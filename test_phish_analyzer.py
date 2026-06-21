@@ -703,7 +703,7 @@ class LinkFlagTests(unittest.TestCase):
             "</body></html>\n")
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            pa.report(*result)
+            pa.report(*result, raw=True)  # raw so the literal domains are present
         links_block = buf.getvalue().split("LINKS (decoded)")[1].split("SIGNALS")[0]
         # The typosquat link is flagged; the ESP tracker is not.
         self.assertIn("(!)", links_block)
@@ -712,6 +712,34 @@ class LinkFlagTests(unittest.TestCase):
                 self.assertIn("(!)", line)
             if "mailchimp.com" in line:
                 self.assertNotIn("(!)", line)
+
+
+class DefangTests(unittest.TestCase):
+    def test_defang_helper(self):
+        self.assertEqual(pa.defang("https://evil.com/a"), "hxxps://evil[.]com/a")
+
+    def test_links_defanged_by_default_raw_optout(self):
+        import contextlib
+        import io
+        result = _analyze(
+            "From: a <a@example.com>\n"
+            "Subject: hi\n"
+            "Authentication-Results: gw.test; dmarc=pass\n"
+            "Content-Type: text/html\n\n"
+            '<html><body><a href="https://evil-site.example/x">y</a></body></html>\n')
+
+        def render(**kw):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                pa.report(*result, **kw)
+            return buf.getvalue().split("LINKS (decoded)")[1].split("SIGNALS")[0]
+
+        default = render()
+        self.assertIn("hxxps://evil-site[.]example", default)
+        self.assertNotIn("https://evil-site.example", default)
+
+        raw = render(raw=True)
+        self.assertIn("https://evil-site.example", raw)
 
 
 class ColorInfoTests(unittest.TestCase):

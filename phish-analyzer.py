@@ -598,6 +598,11 @@ def decode_idna_host(host):
     return '.'.join(out)
 
 
+def defang(s):
+    """Make a URL/host unclickable for safe display: http->hxxp, . -> [.]"""
+    return s.replace('http', 'hxxp').replace('.', '[.]')
+
+
 def proofpoint_in_path(msg):
     for h in msg.keys():
         if h.lower().startswith('x-proofpoint'):
@@ -1219,7 +1224,7 @@ def _print_grouped(items, scored):
 
 
 def report(findings, context, info, decoded, pp, pp_flagged,
-           quiet=False, verbose=False):
+           quiet=False, verbose=False, raw=False):
     score = sum(w for w, _ in findings)
     verdict, vcolor = verdict_for(score)
     meter = risk_meter(score, vcolor)
@@ -1250,17 +1255,19 @@ def report(findings, context, info, decoded, pp, pp_flagged,
                 flagged.update(t.lower() for t in re.findall(r"'([^']+)'", desc))
         shown = decoded if verbose else decoded[:25]
         for d in shown:
-            safe = sanitize(d)
             host = dest_domain(d)
             reg = registrable_domain(host)
-            if reg and reg in safe:  # make the registrable domain stand out
-                safe = safe.replace(reg, c(reg, YELLOW, BOLD), 1)
+            safe = sanitize(d if raw else defang(d))
+            show_reg = reg if raw else defang(reg)
+            if show_reg and show_reg in safe:  # make the registrable domain stand out
+                safe = safe.replace(show_reg, c(show_reg, YELLOW, BOLD), 1)
             implicated = bool(host) and (host in flagged or reg in flagged
                 or any(t in host for t in flagged if len(t) >= 4))
             marker = c("(!)", RED, BOLD) if implicated else c(" - ", DIM)
             line = f"  {marker} " + safe
             if 'xn--' in host:
-                line += sanitize("   [reads as: " + decode_idna_host(host) + "]")
+                reads = decode_idna_host(host)
+                line += sanitize("   [reads as: " + (reads if raw else defang(reads)) + "]")
             print(line)
         if not verbose and len(decoded) > 25:
             print(c(f"  ... +{len(decoded) - 25} more (use --verbose to show all)", DIM))
@@ -1289,8 +1296,9 @@ def report(findings, context, info, decoded, pp, pp_flagged,
     print(c("mismatches, known-bad hits, and Proofpoint's own verdict.", DIM))
 
 
-USAGE = ("Usage: python phish-analyzer.py [-q|--quiet] [-v|--verbose] "
-         "<email.eml | folder> [more...]")
+USAGE = ("Usage: python phish-analyzer.py [-q|--quiet] [-v|--verbose] [--raw] "
+         "<email.eml | folder> [more...]\n"
+         "  --raw  show links live/clickable (default: defanged)")
 
 
 def _gather_targets(args):
@@ -1329,13 +1337,15 @@ def _summary_row(path, result, error):
 
 
 def main():
-    quiet = verbose = False
+    quiet = verbose = raw = False
     args = []
     for arg in sys.argv[1:]:
         if arg in ('-q', '--quiet'):
             quiet = True
         elif arg in ('-v', '--verbose'):
             verbose = True
+        elif arg == '--raw':
+            raw = True
         else:
             args.append(arg)
 
@@ -1361,7 +1371,7 @@ def main():
         if error:
             print(f"[ERROR] Could not analyze {sanitize(path)}: {error}")
             sys.exit(1)
-        report(*result, quiet=quiet, verbose=verbose)
+        report(*result, quiet=quiet, verbose=verbose, raw=raw)
         return
 
     if not quiet:
