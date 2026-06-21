@@ -23,21 +23,16 @@ Trust is decided from the **top** `Authentication-Results` header only - the one
 
 ### Detections
 
-- **Link unwrapping** - decodes Proofpoint URL Defense (v2/v3), Microsoft Safelinks, Mimecast, Barracuda, and Google AMP wrappers to show the real destination
-- **Open-redirect / cloaking** - spots a link on one site whose query string forwards to a different domain ("a link hidden inside a link")
-- **Sender spoofing** - real sending address is parsed from the angle-bracket address (an `@domain` planted in the display name can't fool it); flags a display name that embeds a different brand/domain, role-word impersonation (IT, security, PayPal...) from a mismatched or freemail domain, and a sender domain that is itself a typosquat or homograph of a brand
-- **Auth header analysis** - scores SPF, DKIM, and DMARC failures; auto-lowers confidence when Proofpoint is in the mail path (where URL rewriting legitimately breaks DKIM)
-- **Proofpoint verdict passthrough** - surfaces the `X-Proofpoint` verdict directly; a PPS flag carries the most weight
-- **Header mismatch detection** - Reply-To to freemail/known-bad is a hard BEC tell; ordinary Reply-To/Return-Path splits are soft and skipped entirely for DMARC-passing mail or known ESP/bounce domains, compared at the registrable-domain level
-- **Public Suffix List accuracy** - domain comparisons use the registrable domain (eTLD+1) via a bundled PSL snapshot, so multi-label suffixes (`co.uk`, `com.au`) and cousin domains (`servicea.gov.uk` vs `serviceb.gov.uk`) are handled correctly
-- **Link text vs. href mismatch** - the classic trick of showing `paypal.com` in anchor text while the href goes elsewhere
-- **Look-alike link domains** - mixed-script homographs (`pаypal.com` with a Cyrillic `а`), typosquats of the sender or a known brand (`paypa1.com`), brand names buried as a subdomain (`microsoft.com.verify.ru`), and punycode (`xn--`) domains shown as they actually read
-- **Dangerous link mechanics** - raw-IP hosts, the `user@host` deception trick, `javascript:`/`data:` hrefs, `<form>` posting to an external domain, `<meta http-equiv="refresh">` auto-redirects, link shorteners, high-abuse TLDs, non-standard ports, and excessively deep subdomains
-- **Known-bad lists** - link or sender domains matched against a local blocklist you can refresh from free public feeds (see *Reference lists*)
-- **Attachment triage** - lists each attachment with size and SHA-256; flags dangerous executable/script types, macro-enabled Office files, **HTML/SVG attachments** (local phishing pages), archives, and misleading double extensions (`invoice.pdf.exe`). Files are never opened or detonated
-- **Hidden-text and obfuscation checks** - CSS-hidden text carrying a lure phrase, and zero-width/bidi control characters
-- **Readable report** - a verdict headline up top, decoded links, and signals grouped by category and sorted by weight, with a four-tier risk score (MINIMAL / LOW / MEDIUM / HIGH)
-- **Batch mode** - point it at a folder or several files for a one-line-per-file summary table
+(The weight tables under *How It Works* list every signal; this is the overview.)
+
+- **Link unwrapping & cloaking** - decodes Proofpoint URL Defense (v2/v3), Microsoft Safelinks, Mimecast, Barracuda, and Google AMP, and spots open-redirects that forward to another domain
+- **Look-alike & deceptive links** - homographs (`pаypal.com`), typosquats (`paypa1.com`), brand-as-subdomain (`microsoft.com.verify.ru`), punycode, raw-IP hosts, the `user@host` trick, link-text vs href mismatch, and risky mechanics (`javascript:`/`data:` hrefs, external `<form>` posts, `meta refresh`, shorteners, high-abuse TLDs)
+- **Sender & auth** - parses the real From address (a display-name `@domain` can't fool it), flags display-name/role-word impersonation and sender look-alikes, scores SPF/DKIM/DMARC (Proofpoint-aware), falls back to the `DKIM-Signature` `d=` when there is no `Authentication-Results`, and reads the true originating IP from the `Received` chain past any relay
+- **Header & content obfuscation** - homoglyph and zero-width/bidi tricks in the Subject and From, CSS-hidden lure text, and sharp `text/plain` vs HTML divergence
+- **Attachments** - lists each with size and SHA-256; flags executables, macros, HTML/SVG, archives, and double extensions (`invoice.pdf.exe`). Never opened
+- **Known-bad lists** - link/sender domains matched against a local blocklist refreshable from free feeds (see *Reference lists*)
+- **Accuracy** - all domain comparisons use the registrable domain (eTLD+1) via a bundled Public Suffix List, so `co.uk` and cousin domains are handled correctly
+- **Readable report & batch mode** - verdict headline, signals grouped and weighted, a four-tier score, and a one-line-per-file summary when pointed at a folder
 
 ---
 
@@ -56,7 +51,7 @@ git clone https://github.com/RyanSecEng/phish-analyzer.git
 cd phish-analyzer
 ```
 
-No install step needed. Run directly with Python. The bundled `public_suffix_list.dat` ships with the clone, so there's nothing else to fetch and no network access required at runtime.
+No install step. Run directly with Python; nothing to fetch and no network access at runtime.
 
 To save an email as `.eml`:
 - **Outlook**: File -> Save As -> Outlook Message Format or `.eml`
@@ -133,7 +128,7 @@ the score only when a structural signal also fired and the sender is
 not authenticated or allowlisted; otherwise they are listed as context.
 ```
 
-Here the urgency and greeting cues **are** scored, because hard signals fired and the sender is not authenticated. On a DMARC-passing or allowlisted email those same lines would instead appear under a `=== CONTEXT (not scored) ===` heading and contribute 0 to the score.
+(On a DMARC-passing or allowlisted email, the urgency and greeting lines would move under a `=== CONTEXT (not scored) ===` heading and add 0.)
 
 A batch run (folder or several files) looks like:
 
@@ -213,7 +208,7 @@ If a source is down or changes format, the others still produce a usable file. E
 
 ## Tests
 
-A `unittest` suite (standard library, no extra packages) covers the core logic: Proofpoint v2/v3 link decoding, eTLD+1 registrable-domain comparison, terminal-escape sanitization, typosquat and homograph detection, attachment triage, hidden-text and zero-width detection, the From-address spoof parse, sender/display-name impersonation, top-header auth trust (including the forged-lower-header case), the header-mismatch gate, HTML/SVG attachments, external forms, meta-refresh and `javascript:` links, a `report()` render smoke test, and end-to-end runs over crafted phishing and benign `.eml` fixtures (including false-positive guards for normal third-party links, DMARC-passing mail, and marketing preheaders).
+A standard-library `unittest` suite covers the core logic - link decoding, eTLD+1 comparison, sanitization, look-alike/homograph and header-obfuscation detection, the auth-trust and corroboration gates, attachment and link checks, a `report()` smoke test, and a malformed-input fuzz test - plus end-to-end runs over crafted phishing and benign fixtures with false-positive guards.
 
 ```
 python -m unittest discover -v
@@ -223,9 +218,10 @@ python -m unittest discover -v
 
 ## Known Limitations
 
-- **Proofpoint v2 hex heuristic** - the v2 decoder reverses Proofpoint's `%`->`-` substitution by turning any `-XX` (where `XX` are two hex digits, `0-9`/`a-f`) back into `%XX`. This preserves most literal hyphens, but a hyphen followed by two hex characters in a real link will be mis-decoded, e.g. `support-365.com` or `route-1a.example` get garbled because `-36`/`-1a` look like percent-encodings. Treat a v2-decoded destination containing a hyphen-plus-digits segment with suspicion and verify it manually. URLs without such sequences decode correctly.
+- **Proofpoint v2 decode is heuristic** - the v2 unwrapper turns `-XX` (two hex digits) back into `%XX`, which can garble a literal hyphen-plus-hex in a real link (e.g. `route-1a.example`). Verify a v2-decoded host containing such a sequence by hand.
 - **Content signals are noisy by nature** - urgency words, generic greetings, and credential phrases fire on legitimate bulk mail (password resets, bank statements, IT notifications). That is exactly why they are soft and gated behind the corroboration rule; on their own they appear under `CONTEXT` and score 0. Tune `allowlist.txt` and `esp_domains.txt` to quiet them further for senders you trust.
 - **Trust hinges on the top auth header** - the corroboration gate treats a `dmarc=pass` on the topmost `Authentication-Results` header as trusted. This is correct only if that header was added by *your* mail boundary. If you analyze a raw message captured before it reached your gateway (no trusted header on top), DMARC trust won't apply and more soft signals may score.
+- **Originating sender is only as trustworthy as your boundary** - `Received` hops below the first hop your own infrastructure added are attacker-controlled, so a sender can forge the earliest hop. Treat the reported originating host/IP as a lead to verify, not proof.
 - **Known-bad feed ages fast** - `phish_domains.feed.txt` is a point-in-time snapshot of public feeds; a domain registered after your last `update_feeds.py` run won't be on it. Refresh regularly. The feeds also occasionally list a since-cleaned domain, so a known-bad hit is strong evidence but still worth a glance.
 - **Links are decoded, not fetched** - no DNS lookups, no page rendering, no sandbox. A convincing domain name (`login.microsoftonline.com.verify-account.ru`) requires human judgment to evaluate.
 - **HTML parser is best-effort** - it now catches CSS-hidden text and zero-width/bidi characters, but malformed markup or more exotic tricks (off-screen positioning, colour-on-colour text, image-only bodies) can still slip past.

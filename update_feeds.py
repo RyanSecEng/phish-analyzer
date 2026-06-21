@@ -44,13 +44,17 @@ _IP_RE = re.compile(r'^(?:\d{1,3}(?:\.\d{1,3}){3}|0x[0-9a-f]+|\d{6,})$', re.I)
 _HOST_RE = re.compile(r'^[a-z0-9.-]+\.[a-z]{2,}$')
 
 TIMEOUT = 60
+MAX_DOWNLOAD = 64 * 1024 * 1024  # refuse a feed that balloons past this
 UA = 'phish-analyzer-update-feeds/1.0 (+https://github.com/RyanSecEng/phish-analyzer)'
 
 
 def _fetch(url):
     req = urllib.request.Request(url, headers={'User-Agent': UA})
     with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
-        return resp.read().decode('utf-8', 'replace')
+        data = resp.read(MAX_DOWNLOAD + 1)
+    if len(data) > MAX_DOWNLOAD:
+        raise ValueError(f"feed exceeds {MAX_DOWNLOAD} bytes; refusing")
+    return data.decode('utf-8', 'replace')
 
 
 def _hosts_from_domains(text):

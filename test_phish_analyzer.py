@@ -582,5 +582,111 @@ class BatchTests(unittest.TestCase):
         self.assertIn("boom", err)
 
 
+def _all_descs(findings, context):
+    return (_descs(findings) + " | " + _descs(context)).lower()
+
+
+class HeaderObfuscationTests(unittest.TestCase):
+    def test_homoglyph_in_subject_and_zero_width(self):
+        eml = (
+            "From: Support <help@example.com>\n"
+            "Subject: Verify your Аccount now​\n"  # Cyrillic A + ZWSP
+            "Authentication-Results: gw.test; dmarc=fail\n"
+            "Content-Type: text/plain\n\nhi\n"
+        )
+        findings, _ctx, _info, _dec, _pp, _ppf = _analyze(eml)
+        descs = _descs(findings)
+        self.assertIn("homograph) subject", descs)
+        self.assertIn("zero-width/bidi characters in the subject", descs)
+
+    def test_mixed_script_words_helper(self):
+        self.assertEqual(pa.mixed_script_words("Аpple"), ["Аpple"])
+        self.assertEqual(pa.mixed_script_words("Ivan Smith"), [])
+
+
+class OriginatingHopTests(unittest.TestCase):
+    def test_reads_past_proofpoint(self):
+        received = [
+            "from mx.recipient.com by mail.recipient.com",
+            "from mx1.pphosted.com (mx1.pphosted.com [205.220.165.32]) "
+            "by mail.recipient.com",
+            "from evil-sender.ru (evil-sender.ru [203.0.113.66]) by mx1.pphosted.com",
+        ]
+        self.assertEqual(pa.originating_hop(received),
+                         ("evil-sender.ru", "203.0.113.66"))
+
+    def test_private_ip(self):
+        for ip in ("10.0.0.1", "192.168.1.1", "127.0.0.1", "172.16.5.5"):
+            self.assertTrue(pa._is_private_ip(ip), ip)
+        for ip in ("203.0.113.66", "8.8.8.8"):
+            self.assertFalse(pa._is_private_ip(ip), ip)
+
+
+class DkimFallbackTests(unittest.TestCase):
+    def _msg(self, with_pp):
+        return (
+            "DKIM-Signature: v=1; a=rsa-sha256; d=unrelated-signer.net; s=k1\n"
+            + ("X-Proofpoint-Virus-Version: vendor=baseline\n" if with_pp else "")
+            + "From: Billing <ar@company-corp.com>\n"
+            "Subject: hello\n"
+            "Content-Type: text/plain\n\nhi\n"
+        )
+
+    def test_misaligned_dkim_flagged_without_proofpoint(self):
+        findings, context, _info, _dec, _pp, _ppf = _analyze(self._msg(False))
+        self.assertIn("dkim signing domain", _all_descs(findings, context))
+
+    def test_dkim_not_scored_under_proofpoint(self):
+        findings, context, info, _dec, _pp, _ppf = _analyze(self._msg(True))
+        self.assertNotIn("does not align", _all_descs(findings, context))
+        self.assertTrue(any("dkim-signature d=" in i.lower() for i in info))
+
+
+class DateSanityTests(unittest.TestCase):
+    def test_future_date_flagged(self):
+        eml = (
+            "From: a <a@example.com>\n"
+            "Subject: hi\n"
+            "Date: Wed, 01 Jan 2099 00:00:00 +0000\n"
+            "Content-Type: text/plain\n\nhi\n"
+        )
+        findings, context, _info, _dec, _pp, _ppf = _analyze(eml)
+        self.assertIn("date header is in the future", _all_descs(findings, context))
+
+
+class FuzzTests(unittest.TestCase):
+    """A security tool must not crash on hostile input."""
+    def _run(self, raw):
+        import contextlib
+        import io
+        fd, path = tempfile.mkstemp(suffix=".eml")
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(raw)
+        try:
+            result = pa.analyze(path)
+            self.assertEqual(len(result), 6)
+            with contextlib.redirect_stdout(io.StringIO()):
+                pa.report(*result)
+        finally:
+            os.remove(path)
+
+    def test_malformed_inputs_do_not_crash(self):
+        cases = [
+            b"",
+            b"\x00\x01\x02\x03 not an email at all",
+            b"From: a@b.com\nSubject: x\n\n" + b"A" * 10000,
+            ("From: a@b.com\nContent-Type: multipart/mixed; boundary=b\n\n"
+             "--b\n" * 40).encode(),
+            ("From: a@b.com\nContent-Type: text/html\n\n"
+             + "<div>" * 1000 + "hi").encode(),
+            ("From: a@b.com\nContent-Type: text/html\n\n<a href="
+             + "javascript:" + "x" * 5000 + ">y</a>").encode(),
+            ("Received: " + "from a.b.com " * 500 + "\nFrom: a@b.com\n\nhi").encode(),
+            b"Subject: =?utf-8?B?////?=\nFrom: a@b.com\n\nhi",
+        ]
+        for raw in cases:
+            self._run(raw)
+
+
 if __name__ == "__main__":
     unittest.main()

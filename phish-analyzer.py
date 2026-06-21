@@ -10,6 +10,7 @@ A triage aid, not a verdict. Runs offline, standard library only.
 Usage:
   python phish-analyzer.py [-q|--quiet] [-v|--verbose] <email.eml>
 """
+import datetime
 import email
 import hashlib
 import os
@@ -19,7 +20,7 @@ import time
 import unicodedata
 import urllib.parse
 from email import policy
-from email.utils import parseaddr
+from email.utils import parseaddr, parsedate_to_datetime
 from html.parser import HTMLParser
 
 # Force UTF-8 so box-drawing glyphs survive on Windows consoles.
@@ -190,6 +191,15 @@ _ZW_RE = re.compile(
 # Common character swaps in typosquats, mapped back to what they imitate.
 _CONFUSE_MAP = str.maketrans({'0': 'o', '1': 'l', '3': 'e', '4': 'a',
                               '5': 's', '7': 't', '$': 's', '@': 'a'})
+
+# Scripts whose letters are routinely used to fake Latin ones.
+_CONFUSABLE_SCRIPTS = {'CYRILLIC', 'GREEK', 'ARMENIAN', 'CHEROKEE'}
+
+# Caps so crafted mail can't exhaust CPU/memory. Set well above any real email
+# (legit mail tops out around a few hundred links and a couple dozen attachments).
+_MAX_LINKS = 1000
+_MAX_ATTACH = 50
+_MAX_HOPS = 50
 
 
 def sanitize(s):
@@ -385,7 +395,6 @@ def idn_homograph(host):
     'a' inside 'paypal'). Pure non-Latin IDNs are left alone; only mixed-script
     labels, which are almost always spoofing, are reported."""
     bad = []
-    confusable = {'CYRILLIC', 'GREEK', 'ARMENIAN', 'CHEROKEE'}
     for label in host.split('.'):
         decoded = label
         if label.startswith('xn--'):
@@ -394,9 +403,50 @@ def idn_homograph(host):
             except Exception:
                 decoded = label
         scripts = _label_script(decoded)
-        if 'LATIN' in scripts and scripts & confusable:
+        if 'LATIN' in scripts and scripts & _CONFUSABLE_SCRIPTS:
             bad.append(decoded)
     return bad
+
+
+def mixed_script_words(text):
+    """Words mixing Latin with a confusable script, e.g. 'Аpple' with Cyrillic A.
+    Per-word so a normal Latin + Cyrillic name across two words isn't flagged."""
+    bad = []
+    for word in re.findall(r'[^\W\d_]{2,}', text):
+        scripts = _label_script(word)
+        if 'LATIN' in scripts and scripts & _CONFUSABLE_SCRIPTS:
+            bad.append(word)
+    return bad
+
+
+def _is_private_ip(ip):
+    p = ip.split('.')
+    if len(p) != 4:
+        return False
+    a, b = int(p[0]), int(p[1])
+    return (a in (0, 10, 127) or (a == 192 and b == 168)
+            or (a == 172 and 16 <= b <= 31))
+
+
+def originating_hop(received):
+    """Real sender (host, ip) from the Received chain, read past any Proofpoint
+    relay. Received headers are newest-first, so we walk from the oldest hop and
+    take the first one whose 'from' side is external (the hop where Proofpoint, or
+    your MX, accepted the mail from the real sender)."""
+    for r in list(reversed(received))[:_MAX_HOPS]:
+        s = str(r)
+        host_m = re.search(r'from\s+([a-z0-9.-]{1,255}\.[a-z]{2,24})', s, re.I)
+        host = host_m.group(1).lower() if host_m else ''
+        # Skip a hop only if the sender side is Proofpoint, not the receiving side.
+        if 'pphosted.com' in host or 'proofpoint' in host:
+            continue
+        ip_m = re.search(r'[\[(]((?:\d{1,3}\.){3}\d{1,3})[\])]', s)
+        ip = ip_m.group(1) if ip_m else ''
+        if ip and _is_private_ip(ip):
+            ip = ''
+        if host or ip:
+            return host, ip
+    return '', ''
 
 
 def get_domain(addr):
@@ -617,7 +667,8 @@ class HtmlAnalyzer(HTMLParser):
                 self._skip -= 1
             return
         if tag == 'a' and self._href is not None:
-            self.links.append((self._href, ''.join(self._buf).strip()))
+            if len(self.links) < _MAX_LINKS:
+                self.links.append((self._href, ''.join(self._buf).strip()))
             self._href = None
             self._buf = []
         # Only pop when the top of the stack matches; a stray close tag is ignored.
@@ -756,6 +807,17 @@ def analyze(path):
     for lab in idn_homograph(from_dom):
         hard.append((3, f"Mixed-script (homograph) sender domain: '{lab}'"))
 
+    # Same homoglyph/bidi tricks, but in the readable headers, not just links.
+    display_raw = frm.split('<', 1)[0] if '<' in frm else frm
+    for w in mixed_script_words(display_raw):
+        hard.append((2, f"Mixed-script (homograph) From display name: '{w}'"))
+    for w in mixed_script_words(subject):
+        hard.append((2, f"Mixed-script (homograph) Subject: '{w}'"))
+    if _ZW_RE.search(frm):
+        hard.append((2, "Zero-width/bidi characters in the From header"))
+    if _ZW_RE.search(subject):
+        hard.append((1, "Zero-width/bidi characters in the Subject"))
+
     if auth_headers:
         spf_w, dkim_w, dmarc_w = (1, 1, 1) if pp else (2, 2, 3)
         note = "  (LOW conf - Proofpoint may have broken this)" if pp else ""
@@ -770,6 +832,49 @@ def analyze(path):
         # Usually means the .eml was exported before auth ran, so don't score it.
         info.append("[note] No Authentication-Results header (often stripped when "
                     "saving an .eml); not scored.")
+        # With no verdict to read, fall back to who DKIM-signed. We can't verify
+        # the signature offline, so this never grants trust and stays soft. Skip
+        # it under Proofpoint, which rewrites the body and may re-sign.
+        d_doms = [m.group(1).strip().lower() for m in
+                  (re.search(r'(?:^|;)\s*d\s*=\s*([^;]+)', str(sig), re.I)
+                   for sig in msg.get_all('DKIM-Signature', [])) if m]
+        if d_doms:
+            info.append(f"[note] DKIM-Signature d={', '.join(d_doms[:3])} (unverified)")
+            aligned = any(same_domain_family(d, from_dom)
+                          or registrable_domain(d) in ESP_DOMAINS for d in d_doms)
+            if not aligned and from_dom and not pp:
+                soft.append((1, f"DKIM signing domain ({d_doms[0]}) does not align "
+                                f"with From ({from_dom}); unverified"))
+
+    # The real sender sits below any Proofpoint relay, so the top Received hop is
+    # Proofpoint's IP, not the sender's. Surface the originating hop instead.
+    received = msg.get_all('Received', [])
+    if received:
+        info.append(f"Received: {len(received)} hop(s)")
+        o_host, o_ip = originating_hop(received)
+        if o_host or o_ip:
+            detail = ' '.join(x for x in (o_host, f"[{o_ip}]" if o_ip else '') if x)
+            info.append(f"Originating sender: {detail}"
+                        + ("  (read past Proofpoint relay)" if pp else ""))
+            if o_host and registrable_domain(o_host) in PHISH_DOMAINS:
+                soft.append((1, f"Originating relay '{o_host}' is on the known-bad list"))
+
+    # Date sanity: missing or wildly off is a mild tell.
+    date_hdr = msg.get('Date')
+    if not date_hdr:
+        soft.append((1, "Missing Date header"))
+    else:
+        try:
+            dt = parsedate_to_datetime(str(date_hdr))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=datetime.timezone.utc)
+            off_days = (datetime.datetime.now(datetime.timezone.utc) - dt).days
+            if off_days < -2:
+                soft.append((1, "Date header is in the future"))
+            elif off_days > 3650:
+                soft.append((1, "Date header is implausibly old"))
+        except Exception:
+            soft.append((1, "Unparseable Date header"))
 
     # Common for legit mail services, so keep it as a soft hint.
     mid_dom = msg_id.split('@')[-1].strip('>').lower() if '@' in msg_id else ''
@@ -803,11 +908,26 @@ def analyze(path):
     visible = (text_body + ' ' + parser.visible_text()).lower()
     raw_body = text_body + ' ' + html_body
 
+    # A benign text/plain part paired with very different HTML is a way to show
+    # scanners one story and the reader another. Only fires when both parts are
+    # substantial, so legit "view in browser" stubs don't trip it.
+    plain_words = set(re.findall(r'[a-z0-9]{4,}', text_body.lower()))
+    html_words = set(re.findall(r'[a-z0-9]{4,}', parser.visible_text().lower()))
+    if len(plain_words) >= 5 and len(html_words) >= 5:
+        overlap = len(plain_words & html_words) / len(plain_words | html_words)
+        if overlap < 0.15:
+            soft.append((1, "text/plain and text/html parts differ sharply "
+                            "(possible scanner evasion)"))
+
     # ---------- LINK ANALYSIS ----------
-    # Decode every link so the real destinations are visible. We don't score
+    # Decode each link so the real destinations are visible. We don't score
     # "links off-domain" by itself; legit mail links to trackers and CDNs all the
     # time. The checks below look for deliberate disguises instead.
-    raw_urls = URL_RE.findall(raw_body)
+    raw_urls = []
+    for m in URL_RE.finditer(raw_body):
+        raw_urls.append(m.group(0))
+        if len(raw_urls) >= _MAX_LINKS:
+            break
     decoded = []
     seen_decoded = set()
     for u in raw_urls:
@@ -899,7 +1019,7 @@ def analyze(path):
             seen['deep'].add(host)
 
     seen_mismatch = set()
-    for href, text in parser.links:
+    for href, text in parser.links[:_MAX_LINKS]:
         real = decode_redirect(href)
         real_dom = dest_domain(real)
         if registrable_domain(real_dom) in ESP_DOMAINS:
@@ -913,7 +1033,7 @@ def analyze(path):
 
     # Anchors whose href is a script or inline-data URI rather than a real link.
     seen_scheme = set()
-    for href, _text in parser.links:
+    for href, _text in parser.links[:_MAX_LINKS]:
         scheme = urllib.parse.urlparse(href).scheme.lower()
         if scheme in ('javascript', 'data', 'vbscript') and scheme not in seen_scheme:
             hard.append((2, f"Link uses a '{scheme}:' URI instead of a normal web link"))
@@ -948,7 +1068,7 @@ def analyze(path):
     link_regs.discard('')
     ext_regs = sorted(r for r in link_regs if r not in ESP_DOMAINS)
     if ext_regs:
-        brand_text = (subject + ' ' + visible).lower()
+        brand_text = (subject + ' ' + visible)[:65536].lower()
         for b in BRANDS:
             bname = b.split('.', 1)[0]
             if len(bname) < 4:
@@ -983,7 +1103,9 @@ def analyze(path):
         hard.append((1, "Zero-width or bidi control characters in body (obfuscation)"))
 
     # ---------- ATTACHMENTS ----------
-    for name, asize, digest, exts in attachments(msg):
+    for i, (name, asize, digest, exts) in enumerate(attachments(msg)):
+        if i >= _MAX_ATTACH:
+            break
         info.append(f"[Attachment] {name}  ({asize} bytes)  sha256={digest}")
         last = exts[-1] if exts else ''
         if len(exts) >= 2 and exts[-2] not in DANGEROUS_EXT and last in DANGEROUS_EXT:
@@ -1052,7 +1174,9 @@ def _signal_group(desc):
         return 'Attachments'
     if any(k in d for k in ('reply-to', 'return-path', 'message-id',
                             'display name', 'sender domain', 'from freemail',
-                            'homograph) sender')):
+                            'homograph) sender', 'homograph) subject',
+                            'in the from header', 'in the subject', 'date header',
+                            'originating relay')):
         return 'Sender / headers'
     if any(k in d for k in ('link', 'redirect', 'brand domain', 'form ',
                             'punycode', "'@'", 'ip address', 'shorten', 'tld',
@@ -1087,9 +1211,10 @@ def report(findings, context, info, decoded, pp, pp_flagged,
         print(verdict_line)
         return
 
-    # Lead with the answer: verdict plus the heaviest few signals.
+    # Lead with the answer: verdict, counts, and the heaviest few signals.
     print("\n" + _hdr("VERDICT"))
     print("  " + verdict_line)
+    print(c(f"  {len(findings)} scored signal(s), {len(context)} context item(s)", DIM))
     for w, desc in sorted(findings, key=lambda f: -f[0])[:3]:
         print(f"    {c(f'[+{w}]', weight_color(w), BOLD)} {sanitize(desc)}")
 
@@ -1101,8 +1226,12 @@ def report(findings, context, info, decoded, pp, pp_flagged,
     if decoded:
         shown = decoded if verbose else decoded[:25]
         for d in shown:
-            line = "  -> " + sanitize(d)
+            safe = sanitize(d)
             host = dest_domain(d)
+            reg = registrable_domain(host)
+            if reg and reg in safe:  # make the registrable domain stand out
+                safe = safe.replace(reg, c(reg, YELLOW, BOLD), 1)
+            line = "  -> " + safe
             if 'xn--' in host:
                 line += sanitize("   [reads as: " + decode_idna_host(host) + "]")
             print(line)
