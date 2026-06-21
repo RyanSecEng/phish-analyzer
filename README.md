@@ -233,15 +233,6 @@ python -m unittest discover -v
 
 ---
 
-## Roadmap
-
-- JSON output flag for piping results into a SIEM or ticketing system
-- `--no-color` and `--help`/`-h` flags, and exit codes by risk tier for scripting
-- Recursive batch mode (walk subfolders) and an optional CSV summary
-- Optional online enrichment (Safe Browsing, VirusTotal by hash/URL-ID) behind an explicit `--online` flag, off by default
-
----
-
 ## Maintenance
 
 ### Updating the Public Suffix List
