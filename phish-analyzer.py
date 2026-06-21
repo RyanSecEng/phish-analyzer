@@ -1148,6 +1148,24 @@ def _hdr(title):
     return c(f"=== {title} ===", BRAND, BOLD)
 
 
+def _color_info(line):
+    """Tint a few key header-summary fields. No-op when color is off."""
+    if line.startswith('[note]'):
+        return c(line, DIM)
+    if line.startswith('[WARN]'):
+        return c(line, YELLOW)
+    if line.startswith('Known-bad list:') and 'stale' in line:
+        return c(line, YELLOW)
+    for label, col in (('Proofpoint in path:', None),
+                       ('Originating sender:', YELLOW)):
+        if line.startswith(label):
+            val = line[len(label):]
+            if col is None:  # Proofpoint: YES stands out, no stays quiet
+                col = CYAN if 'YES' in val else DIM
+            return label + c(val, col, BOLD)
+    return line
+
+
 def verdict_for(score):
     if score >= 6:
         return "HIGH - strong phishing indicators", RED
@@ -1194,7 +1212,7 @@ def _print_grouped(items, scored):
         if not rows:
             continue
         rows.sort(key=lambda r: -r[0])
-        print(c(f"  {group}", BOLD))
+        print(c(f"  {group} ({len(rows)})", BRAND, BOLD))
         for w, desc in rows:
             tag = c(f'[+{w}]', weight_color(w), BOLD) if scored else c('[ ]', DIM)
             print(f"    {tag} {sanitize(desc)}")
@@ -1220,10 +1238,16 @@ def report(findings, context, info, decoded, pp, pp_flagged,
 
     print("\n" + _hdr("HEADER SUMMARY"))
     for line in info:
-        print("  " + sanitize(line))
+        print("  " + _color_info(sanitize(line)))
 
     print("\n" + _hdr("LINKS (decoded)"))
     if decoded:
+        # Domains named in any link-related signal, so we can flag the implicated
+        # link inline and let benign trackers fade into the background.
+        flagged = set()
+        for _w, desc in list(findings) + list(context):
+            if _signal_group(desc) == 'Links':
+                flagged.update(t.lower() for t in re.findall(r"'([^']+)'", desc))
         shown = decoded if verbose else decoded[:25]
         for d in shown:
             safe = sanitize(d)
@@ -1231,7 +1255,10 @@ def report(findings, context, info, decoded, pp, pp_flagged,
             reg = registrable_domain(host)
             if reg and reg in safe:  # make the registrable domain stand out
                 safe = safe.replace(reg, c(reg, YELLOW, BOLD), 1)
-            line = "  -> " + safe
+            implicated = bool(host) and (host in flagged or reg in flagged
+                or any(t in host for t in flagged if len(t) >= 4))
+            marker = c("(!)", RED, BOLD) if implicated else c(" - ", DIM)
+            line = f"  {marker} " + safe
             if 'xn--' in host:
                 line += sanitize("   [reads as: " + decode_idna_host(host) + "]")
             print(line)

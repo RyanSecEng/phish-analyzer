@@ -688,5 +688,42 @@ class FuzzTests(unittest.TestCase):
             self._run(raw)
 
 
+class LinkFlagTests(unittest.TestCase):
+    def test_implicated_link_marked_benign_not(self):
+        import contextlib
+        import io
+        result = _analyze(
+            "From: a <a@example.com>\n"
+            "Subject: hi\n"
+            "Authentication-Results: gw.test; dmarc=pass\n"
+            "Content-Type: text/html\n\n"
+            '<html><body>'
+            '<a href="https://paypa1.com/login">x</a>'
+            '<a href="https://track.mailchimp.com/o">y</a>'
+            "</body></html>\n")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            pa.report(*result)
+        links_block = buf.getvalue().split("LINKS (decoded)")[1].split("SIGNALS")[0]
+        # The typosquat link is flagged; the ESP tracker is not.
+        self.assertIn("(!)", links_block)
+        for line in links_block.splitlines():
+            if "paypa1.com" in line:
+                self.assertIn("(!)", line)
+            if "mailchimp.com" in line:
+                self.assertNotIn("(!)", line)
+
+
+class ColorInfoTests(unittest.TestCase):
+    def test_noop_when_color_disabled(self):
+        # COLOR_ENABLED is False under test (stdout is not a tty), so the helper
+        # must return the line untouched.
+        for line in ("Proofpoint in path: YES",
+                     "Originating sender: host [1.2.3.4]",
+                     "[note] something",
+                     "From:        a@b.com"):
+            self.assertEqual(pa._color_info(line), line)
+
+
 if __name__ == "__main__":
     unittest.main()
