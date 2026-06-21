@@ -1351,8 +1351,24 @@ def report(findings, context, info, decoded, pp, pp_flagged,
 
 
 USAGE = ("Usage: python phish-analyzer.py [-q|--quiet] [-v|--verbose] [--raw] "
-         "<email.eml | folder> [more...]\n"
-         "  --raw  show links live/clickable (default: defanged)")
+         "[--no-color] <email.eml | folder> [more...]")
+
+HELP = USAGE + """
+
+Local, offline phishing triage for saved .eml files. One file prints a full
+report; a folder (or several files) prints a one-line-per-file summary.
+
+Options:
+  -q, --quiet     Print only the risk-score line per file.
+  -v, --verbose   Show full detail, including every decoded link.
+  --raw           Show links live/clickable (default: defanged, e.g. hxxp://e[.]vil).
+  --no-color      Disable colored output.
+  -h, --help      Show this help and exit.
+
+Examples:
+  python phish-analyzer.py suspicious.eml
+  python phish-analyzer.py ./samples
+  python phish-analyzer.py a.eml b.eml --raw"""
 
 
 def _gather_targets(args):
@@ -1391,18 +1407,30 @@ def _summary_row(path, result, error):
 
 
 def main():
-    quiet = verbose = raw = False
+    global COLOR_ENABLED
+    quiet = verbose = raw = no_color = False
     args = []
     for arg in sys.argv[1:]:
-        if arg in ('-q', '--quiet'):
+        if arg in ('-h', '--help'):
+            print(HELP)
+            sys.exit(0)
+        elif arg in ('-q', '--quiet'):
             quiet = True
         elif arg in ('-v', '--verbose'):
             verbose = True
         elif arg == '--raw':
             raw = True
+        elif arg == '--no-color':
+            no_color = True
+        elif arg.startswith('-'):
+            print(f"[ERROR] Unknown option: {sanitize(arg)}")
+            print(USAGE)
+            sys.exit(1)
         else:
             args.append(arg)
 
+    if no_color:
+        COLOR_ENABLED = False
     if quiet and verbose:
         print("[ERROR] --quiet and --verbose are mutually exclusive.")
         sys.exit(1)

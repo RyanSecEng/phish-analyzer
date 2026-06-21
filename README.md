@@ -77,6 +77,8 @@ A single file prints the full report. Point it at a folder (or pass several file
 | `-q`, `--quiet` | Print only the risk-score line per file (banner, headers, and detail suppressed). Handy for scripting or scanning many files. |
 | `-v`, `--verbose` | Show full detail, including every decoded link (the default view caps the list at 25). |
 | `--raw` | Show links live/clickable. By default links are defanged (`hxxps://evil[.]com`) so you can't fatfinger a live phishing URL. |
+| `--no-color` | Disable colored output (same as setting `NO_COLOR`). |
+| `-h`, `--help` | Show usage, options, and examples, then exit. |
 
 The report leads with a `VERDICT` block (tier, score, and the heaviest few signals), then header summary, decoded links, and the full `SIGNALS` list grouped under Authentication / Sender / Links / Attachments / Content and sorted by weight. Output is **color-coded** by risk tier with a severity meter, e.g. `RISK SCORE 25  [██████████]  HIGH`. Colors are emitted only to an interactive terminal and are disabled when output is piped or redirected, or when `NO_COLOR` is set.
 

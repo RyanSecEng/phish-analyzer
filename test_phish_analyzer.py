@@ -818,5 +818,38 @@ class PdfActiveContentTests(unittest.TestCase):
         self.assertNotIn("active content", _descs(findings))
 
 
+class CliTests(unittest.TestCase):
+    def _run_main(self, argv):
+        import contextlib
+        import io
+        import sys
+        buf = io.StringIO()
+        old = sys.argv
+        sys.argv = ["phish-analyzer.py"] + argv
+        try:
+            with contextlib.redirect_stdout(buf):
+                with self.assertRaises(SystemExit) as cm:
+                    pa.main()
+            return cm.exception.code, buf.getvalue()
+        finally:
+            sys.argv = old
+
+    def test_help_exits_zero(self):
+        code, out = self._run_main(["--help"])
+        self.assertEqual(code, 0)
+        self.assertIn("--no-color", out)
+        self.assertIn("Examples:", out)
+
+    def test_unknown_flag_errors(self):
+        code, out = self._run_main(["--bogus"])
+        self.assertEqual(code, 1)
+        self.assertIn("Unknown option", out)
+
+    def test_no_args_shows_usage(self):
+        code, out = self._run_main([])
+        self.assertEqual(code, 1)
+        self.assertIn("Usage:", out)
+
+
 if __name__ == "__main__":
     unittest.main()
