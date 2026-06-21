@@ -714,6 +714,43 @@ class LinkFlagTests(unittest.TestCase):
                 self.assertNotIn("(!)", line)
 
 
+class SenderAuthTests(unittest.TestCase):
+    def test_auth_status_helper(self):
+        self.assertEqual(pa._auth_status('dmarc=pass', 'dmarc=pass', False, '')[0],
+                         'PASS')
+        self.assertEqual(pa._auth_status('', 'dmarc=fail', False, '')[0], 'FAIL')
+        self.assertEqual(pa._auth_status('', 'spf=fail', False, '')[0], 'FAIL')
+        # Proofpoint makes raw auth unreliable, so never a hard FAIL verdict.
+        self.assertEqual(pa._auth_status('', 'dmarc=fail', True, '')[0], 'UNKNOWN')
+        self.assertEqual(pa._auth_status('', '', False, '')[0], 'UNKNOWN')
+
+    def test_verdict_line_in_info(self):
+        spoof = _analyze("From: IT <it@bank.com>\nSubject: hi\n"
+                         "Authentication-Results: gw.test; dmarc=fail\n"
+                         "Content-Type: text/plain\n\nhi\n")[2]
+        self.assertTrue(any(i.startswith("Sender authentication: FAIL")
+                            for i in spoof))
+        clean = _analyze("From: a <a@example.com>\nSubject: hi\n"
+                         "Authentication-Results: gw.test; dmarc=pass\n"
+                         "Content-Type: text/plain\n\nhi\n")[2]
+        self.assertTrue(any(i.startswith("Sender authentication: PASS")
+                            for i in clean))
+
+    def test_multiple_from_addresses_flagged(self):
+        findings, context, _i, _d, _p, _pf = _analyze(
+            "From: a@example.com, b@evil.ru\nSubject: hi\n"
+            "Authentication-Results: gw.test; dmarc=fail\n"
+            "Content-Type: text/plain\n\nhi\n")
+        self.assertIn("from header lists 2 addresses", _all_descs(findings, context))
+
+    def test_received_spf_fallback_when_no_authresults(self):
+        findings, context, info, _d, _p, _pf = _analyze(
+            "From: a <a@example.com>\nReceived-SPF: fail (bad)\nSubject: hi\n"
+            "Content-Type: text/plain\n\nhi\n")
+        self.assertIn("received-spf: fail", _all_descs(findings, context))
+        self.assertTrue(any("Received-SPF=fail" in i for i in info))
+
+
 class DefangTests(unittest.TestCase):
     def test_defang_helper(self):
         self.assertEqual(pa.defang("https://evil.com/a"), "hxxps://evil[.]com/a")

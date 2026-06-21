@@ -20,7 +20,7 @@ import time
 import unicodedata
 import urllib.parse
 from email import policy
-from email.utils import parseaddr, parsedate_to_datetime
+from email.utils import getaddresses, parseaddr, parsedate_to_datetime
 from html.parser import HTMLParser
 
 # Force UTF-8 so box-drawing glyphs survive on Windows consoles.
@@ -603,6 +603,24 @@ def defang(s):
     return s.replace('http', 'hxxp').replace('.', '[.]')
 
 
+def _auth_status(top_auth, all_auth, pp, received_spf):
+    """One-line spoof verdict from the auth headers. Advisory; the SPF/DKIM/DMARC
+    scoring below is separate. PASS only on a real aligned DMARC pass."""
+    if 'dmarc=pass' in top_auth:
+        return 'PASS', 'From domain authenticated (DMARC aligned)'
+    if pp:
+        return 'UNKNOWN', 'Proofpoint may have altered auth; weigh links/content'
+    if 'dmarc=fail' in all_auth:
+        return 'FAIL', 'DMARC failed, From may be spoofed'
+    if any(x in all_auth for x in ('spf=fail', 'spf=softfail', 'dkim=fail')):
+        return 'FAIL', 'SPF/DKIM failed, From may be spoofed'
+    if all_auth:
+        return 'UNKNOWN', 'no DMARC verdict (domain may not enforce DMARC)'
+    if received_spf:
+        return 'UNKNOWN', f'no Authentication-Results; Received-SPF={received_spf}'
+    return 'UNKNOWN', 'no Authentication-Results in this .eml'
+
+
 def proofpoint_in_path(msg):
     for h in msg.keys():
         if h.lower().startswith('x-proofpoint'):
@@ -758,6 +776,24 @@ def analyze(path):
         info.append("[note] A lower Authentication-Results header claims dmarc=pass "
                     "but the top (trusted) header does not; not treated as trusted.")
 
+    # Received-SPF is a second auth source when Authentication-Results is absent.
+    spf_hdr = msg.get('Received-SPF')
+    received_spf = str(spf_hdr).strip().split(None, 1)[0].lower() if spf_hdr else ''
+
+    auth_state, auth_detail = _auth_status(top_auth, all_auth, pp, received_spf)
+    info.append(f"Sender authentication: {auth_state} - {auth_detail}")
+
+    # Who DKIM-signed (the d= tag), checked for From alignment. Unverified offline,
+    # so it's context only; scored just when there's no Authentication-Results.
+    d_doms = [m.group(1).strip().lower() for m in
+              (re.search(r'(?:^|;)\s*d\s*=\s*([^;]+)', str(sig), re.I)
+               for sig in msg.get_all('DKIM-Signature', [])) if m]
+    d_aligned = any(same_domain_family(d, from_dom)
+                    or registrable_domain(d) in ESP_DOMAINS for d in d_doms)
+    if d_doms:
+        info.append(f"[note] DKIM-Signature d={', '.join(d_doms[:3])} "
+                    f"({'aligned' if d_aligned else 'not aligned'} with From, unverified)")
+
     pp_flagged = False
     for h in msg.keys():
         if h.lower().startswith('x-proofpoint'):
@@ -823,6 +859,12 @@ def analyze(path):
     if _ZW_RE.search(subject):
         hard.append((1, "Zero-width/bidi characters in the Subject"))
 
+    # More than one address in From confuses DMARC alignment and what clients show.
+    from_addrs = [a for _n, a in getaddresses(msg.get_all('From', [])) if '@' in a]
+    if len(from_addrs) > 1:
+        hard.append((2, f"From header lists {len(from_addrs)} addresses "
+                        "(used to confuse DMARC/display)"))
+
     if auth_headers:
         spf_w, dkim_w, dmarc_w = (1, 1, 1) if pp else (2, 2, 3)
         note = "  (LOW conf - Proofpoint may have broken this)" if pp else ""
@@ -834,22 +876,16 @@ def analyze(path):
         if 'dmarc=fail' in all_auth:
             hard.append((dmarc_w, "DMARC failed" + note))
     else:
-        # Usually means the .eml was exported before auth ran, so don't score it.
+        # No verdict to read (often the .eml was exported before auth ran). Fall
+        # back to the unverified DKIM d= alignment and Received-SPF; soft only,
+        # and skipped under Proofpoint, which rewrites the body and may re-sign.
         info.append("[note] No Authentication-Results header (often stripped when "
                     "saving an .eml); not scored.")
-        # With no verdict to read, fall back to who DKIM-signed. We can't verify
-        # the signature offline, so this never grants trust and stays soft. Skip
-        # it under Proofpoint, which rewrites the body and may re-sign.
-        d_doms = [m.group(1).strip().lower() for m in
-                  (re.search(r'(?:^|;)\s*d\s*=\s*([^;]+)', str(sig), re.I)
-                   for sig in msg.get_all('DKIM-Signature', [])) if m]
-        if d_doms:
-            info.append(f"[note] DKIM-Signature d={', '.join(d_doms[:3])} (unverified)")
-            aligned = any(same_domain_family(d, from_dom)
-                          or registrable_domain(d) in ESP_DOMAINS for d in d_doms)
-            if not aligned and from_dom and not pp:
-                soft.append((1, f"DKIM signing domain ({d_doms[0]}) does not align "
-                                f"with From ({from_dom}); unverified"))
+        if d_doms and not d_aligned and from_dom and not pp:
+            soft.append((1, f"DKIM signing domain ({d_doms[0]}) does not align "
+                            f"with From ({from_dom}); unverified"))
+        if received_spf in ('fail', 'softfail') and not pp:
+            soft.append((1, f"Received-SPF: {received_spf} (no Authentication-Results)"))
 
     # The real sender sits below any Proofpoint relay, so the top Received hop is
     # Proofpoint's IP, not the sender's. Surface the originating hop instead.
@@ -1155,6 +1191,9 @@ def _hdr(title):
 
 def _color_info(line):
     """Tint a few key header-summary fields. No-op when color is off."""
+    if line.startswith('Sender authentication:'):
+        col = GREEN if ' PASS ' in line else RED if ' FAIL ' in line else YELLOW
+        return c(line, col, BOLD)
     if line.startswith('[note]'):
         return c(line, DIM)
     if line.startswith('[WARN]'):
@@ -1234,15 +1273,20 @@ def report(findings, context, info, decoded, pp, pp_flagged,
         print(verdict_line)
         return
 
-    # Lead with the answer: verdict, counts, and the heaviest few signals.
+    # Lead with the answer: verdict, the spoof check, counts, heaviest signals.
     print("\n" + _hdr("VERDICT"))
     print("  " + verdict_line)
+    auth_line = next((l for l in info if l.startswith('Sender authentication:')), '')
+    if auth_line:
+        print("  " + _color_info(sanitize(auth_line)))
     print(c(f"  {len(findings)} scored signal(s), {len(context)} context item(s)", DIM))
     for w, desc in sorted(findings, key=lambda f: -f[0])[:3]:
         print(f"    {c(f'[+{w}]', weight_color(w), BOLD)} {sanitize(desc)}")
 
     print("\n" + _hdr("HEADER SUMMARY"))
     for line in info:
+        if line.startswith('Sender authentication:'):
+            continue  # shown in the VERDICT block above
         print("  " + _color_info(sanitize(line)))
 
     print("\n" + _hdr("LINKS (decoded)"))
